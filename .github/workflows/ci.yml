@@ -14,19 +14,45 @@ jobs:
         python-version: ["3.11", "3.12"]
 
     steps:
+      # Pull the code
       - name: Checkout code
         uses: actions/checkout@v5
 
+      # Install Python
       - name: Set up Python ${{ matrix.python-version }}
         uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
 
+      # Auto-detect where pyproject.toml lives (root or nested folder)
+      - name: Locate project directory
+        run: |
+          if [ -f "pyproject.toml" ]; then
+            echo "PROJECT_DIR=." >> "$GITHUB_ENV"
+            echo "OK: pyproject.toml found at repo root."
+          elif [ -f "pyharness/pyproject.toml" ]; then
+            echo "PROJECT_DIR=pyharness" >> "$GITHUB_ENV"
+            echo "OK: pyproject.toml found in ./pyharness (nested)."
+          else
+            echo "::error::pyproject.toml not found anywhere!"
+            echo "Repository root contains:"
+            ls -la
+            exit 1
+          fi
+
+      # Install the package and all test dependencies
       - name: Install dependencies
+        working-directory: ${{ env.PROJECT_DIR }}
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[all,dev]"
 
+      # Run the test suite (colors disabled to keep output plain)
       - name: Run tests
+        working-directory: ${{ env.PROJECT_DIR }}
+        env:
+          NO_COLOR: 1
+          FORCE_COLOR: 0
+          TERM: dumb
         run: |
           pytest tests/ -v --tb=short
