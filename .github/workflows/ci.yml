@@ -22,28 +22,11 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Locate project directory
-        run: |
-          if [ -f "pyproject.toml" ]; then
-            echo "PROJECT_DIR=." >> "$GITHUB_ENV"
-            echo "OK: pyproject.toml found at repo root."
-          elif [ -f "pyharness/pyproject.toml" ]; then
-            echo "PROJECT_DIR=pyharness" >> "$GITHUB_ENV"
-            echo "OK: pyproject.toml found in ./pyharness (nested)."
-          else
-            echo "::error::pyproject.toml not found anywhere!"
-            echo "Repository root contains:"
-            ls -la
-            exit 1
-          fi
-
       - name: Install dependencies
-        working-directory: ${{ env.PROJECT_DIR }}
         run: |
           python -m pip install --upgrade pip
           pip install -e ".[all,dev]"
 
       - name: Run tests
-        working-directory: ${{ env.PROJECT_DIR }}
         run: |
           pytest tests/ -v --tb=short
