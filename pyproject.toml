@@ -1,0 +1,96 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pyharness-ai"
+version = "0.6.2"
+description = "PyHarness: Everything is a Plugin. A Python Agent Framework."
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.11"
+authors = [
+    {name = "PyHarness", email = "contact@pyharness.io"},
+]
+keywords = ["agent", "ai", "llm", "framework", "plugin", "mcp", "rag", "workflow"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Topic :: Software Development :: Libraries :: Application Frameworks",
+]
+dependencies = ["pluggy>=1.5", "pydantic>=2.7"]
+
+[project.urls]
+Homepage = "https://github.com/pyharness/pyharness"
+Repository = "https://github.com/pyharness/pyharness"
+Issues = "https://github.com/pyharness/pyharness/issues"
+
+[project.scripts]
+pyharness = "pyharness.cli:app"
+
+[project.optional-dependencies]
+cli = ["typer>=0.12", "rich>=13.7"]
+server = ["fastapi>=0.110", "uvicorn[standard]>=0.29", "websockets>=12", "aiofiles>=23.0"]
+llm = ["httpx>=0.27"]
+web = ["httpx>=0.27", "beautifulsoup4>=4.12", "markdownify>=0.12"]
+memory = ["aiosqlite>=0.20"]
+rag = ["numpy>=1.26"]
+mcp = ["httpx>=0.27"]
+dev = [
+    "pytest>=8",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+    "fastapi[standard]>=0.110",
+    "websockets>=12",
+    "aiofiles>=23.0",
+]
+all = [
+    "typer>=0.12",
+    "rich>=13.7",
+    "fastapi>=0.110",
+    "uvicorn[standard]>=0.29",
+    "websockets>=12",
+    "aiofiles>=23.0",
+    "httpx>=0.27",
+    "beautifulsoup4>=4.12",
+    "markdownify>=0.12",
+    "aiosqlite>=0.20",
+    "numpy>=1.26",
+]
+
+# Everything is a plugin: plugins discover & register through this group.
+[project.entry-points."pyharness.plugins"]
+builtin = "pyharness.plugins.builtin"
+llm = "pyharness.plugins.llm.entry"
+context-compaction = "pyharness.plugins.context_compaction"
+guard-approval = "pyharness.plugins.guard_approval"
+ui-cli = "pyharness.plugins.ui_cli"
+fs = "pyharness.plugins.tool_fs"
+web = "pyharness.plugins.tool_web"
+memory = "pyharness.plugins.session_store"
+subagent = "pyharness.plugins.tool_subagent"
+workflow = "pyharness.plugins.workflow"
+mcp = "pyharness.plugins.mcp_client"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/pyharness"]
+
+[tool.hatch.build.targets.sdist]
+include = ["src/", "README.md", "LICENSE", "static/", "mcp_servers.json"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+filterwarnings = ["ignore:.*starlette.testclient.*deprecated.*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP"]
