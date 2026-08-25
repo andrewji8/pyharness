@@ -22,6 +22,11 @@
             "command": "npx",
             "args": ["-y", "@modelcontextprotocol/server-puppeteer"],
             "enabled": false
+        },
+        "fetch": {
+            "command": "npx",
+            "args": ["-y", "@modelcontextprotocol/server-fetch"],
+            "enabled": false
         }
     }
 }

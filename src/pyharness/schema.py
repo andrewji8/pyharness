@@ -118,6 +118,7 @@ class Message(Frozen):
     content: str
     name: str | None = Field(default=None, description="Tool/role name, when relevant.")
     tool_calls: tuple["ToolCall", ...] = Field(default_factory=tuple)
+    tool_call_id: str | None = Field(default=None, description="Tool call ID for tool messages.")
 
 
 class ToolCall(Frozen):
@@ -135,6 +136,7 @@ class LLMRequest(Frozen):
     messages: tuple[Message, ...] = Field(default_factory=tuple)
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     max_tokens: int | None = Field(default=None, ge=1)
+    tools: list[dict[str, Any]] = Field(default_factory=list, description="OpenAI-format tool definitions for function calling.")
 
 
 class LLMResponse(Frozen):

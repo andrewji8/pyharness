@@ -27,7 +27,7 @@ from typing import TYPE_CHECKING, Any
 
 from pluggy import PluginManager
 
-from pyharness.context import SessionContext, _subagent_depth, open_session
+from pyharness.context import SessionContext, _subagent_depth, current_context, open_session
 from pyharness.schema import (
     AgentConfig,
     Event,
@@ -75,6 +75,84 @@ async def _settle(values: tuple[Any, ...]) -> list[Any]:
             logger = logging.getLogger("pyharness.core")
             logger.error("Hook implementation raised an exception: %s", exc, exc_info=True)
     return settled
+
+
+def _tool_specs_to_openai_tools(specs: list[Any]) -> list[dict[str, Any]]:
+    """Convert PyHarness ToolSpec list to OpenAI function-calling format."""
+    tools: list[dict[str, Any]] = []
+    for spec in specs:
+        if not hasattr(spec, "name") or not hasattr(spec, "parameters"):
+            continue
+        properties: dict[str, Any] = {}
+        required: list[str] = []
+        for param in getattr(spec, "parameters", ()) or ():
+            param_type = getattr(param, "type", "string") or "string"
+            properties[param.name] = {
+                "type": param_type,
+                "description": getattr(param, "description", "") or "",
+            }
+            if getattr(param, "required", False):
+                required.append(param.name)
+        tool_def: dict[str, Any] = {
+            "type": "function",
+            "function": {
+                "name": spec.name,
+                "description": getattr(spec, "description", "") or spec.name,
+                "parameters": {
+                    "type": "object",
+                    "properties": properties,
+                    "required": required,
+                },
+            },
+        }
+        tools.append(tool_def)
+    return tools
+
+
+# ---------------------------------------------------------------------------
+# Default system prompt (injected when agent.system_prompt is empty)
+# ---------------------------------------------------------------------------
+_DEFAULT_SYSTEM_PROMPT_TEMPLATE = """\
+你是 PyHarness，一个具备联网能力的 AI Agent。你拥有以下工具：
+
+{工具能力描述}
+
+核心规则：
+1. 当用户询问新闻、天气、股价、最新事件等任何实时信息时，你必须先调用联网工具获取数据，再基于工具返回的结果回答。
+2. 当被问"你能联网吗"时，回答："可以，我能通过工具获取实时信息。"
+3. 严禁直接回答"我无法联网"或"我没有联网能力"。
+4. 优先使用工具获取准确信息，而不是依赖训练数据中的过期信息。
+5. 当任务包含 2 个以上步骤时，必须先调用 workflow 工具创建执行计划，再按计划逐步执行。"""
+
+
+def _build_default_system_prompt(harness: "Harness", ctx: SessionContext, agent: AgentConfig) -> str:
+    """Dynamically build a system prompt that lists available tools.
+
+    Queries ``get_tool_specs`` to discover all registered tools, then formats
+    them into the prompt so the LLM knows what it can call.
+    """
+    try:
+        specs: dict[str, Any] = {}
+        for plugin_specs in harness.bus.pm.hook.get_tool_specs(context=ctx):
+            if plugin_specs is not None:
+                specs.update({s.name: s for s in plugin_specs})
+
+        if not specs:
+            return "你是 PyHarness，一个 AI Agent。"
+
+        tool_lines: list[str] = []
+        for name, spec in specs.items():
+            params = ", ".join(
+                f"{p.name} ({p.type})" + (" *" if p.required else "")
+                for p in getattr(spec, "parameters", ())
+            )
+            desc = getattr(spec, "description", "") or name
+            tool_lines.append(f"- `{name}`: {desc} [参数: {params}]" if params else f"- `{name}`: {desc}")
+
+        tool_text = "\n".join(tool_lines)
+        return _DEFAULT_SYSTEM_PROMPT_TEMPLATE.format(工具能力描述=tool_text)
+    except Exception:
+        return "你是 PyHarness，一个具备联网能力的 AI Agent。"
 
 
 class EventBus:
@@ -192,6 +270,7 @@ class Harness:
         *,
         continue_from: SessionContext | None = None,
         resume_session_id: str | None = None,
+        namespace: str | None = None,
     ) -> SessionContext:
         """Open (or continue) an isolated context and drive the agent loop.
 
@@ -236,7 +315,14 @@ class Harness:
                     break
 
         async with open_session(namespace=self.config.namespace, context=resume_ctx) as ctx:
-            self.bus.pm.hook.session_started(context=ctx, agent=agent)
+            # Inject default system prompt when none is provided.
+            effective_agent = agent
+            if not agent.system_prompt:
+                default_prompt = _build_default_system_prompt(self, ctx, agent)
+                if default_prompt:
+                    effective_agent = agent.model_copy(update={"system_prompt": default_prompt})
+
+            self.bus.pm.hook.session_started(context=ctx, agent=effective_agent)
 
             if initial_text is not None:
                 ctx = ctx.append_message(Message(role=Role.USER, content=initial_text))
@@ -247,8 +333,8 @@ class Harness:
                 )
 
             steps = 0
-            while steps < agent.max_steps:
-                resp = await self._agent_next(ctx, agent)
+            while steps < effective_agent.max_steps:
+                resp = await self._agent_next(ctx, effective_agent)
                 if resp is None:
                     break
 
@@ -266,7 +352,7 @@ class Harness:
                     )
                     break
 
-                if await self._should_stop(ctx, agent):
+                if await self._should_stop(ctx, effective_agent):
                     break
                 steps += 1
 
@@ -294,6 +380,7 @@ class Harness:
         *,
         continue_from: SessionContext | None = None,
         resume_session_id: str | None = None,
+        namespace: str | None = None,
     ) -> AsyncIterator[LLMStreamChunk]:
         """Same loop as :meth:`run_session` but streams assistant deltas.
 
@@ -326,8 +413,15 @@ class Harness:
                     )
                     break
 
-        async with open_session(namespace=self.config.namespace, context=resume_ctx) as ctx:
-            self.bus.pm.hook.session_started(context=ctx, agent=agent)
+        async with open_session(namespace=namespace or self.config.namespace, context=resume_ctx) as ctx:
+            # Inject default system prompt when none is provided.
+            effective_agent = agent
+            if not agent.system_prompt:
+                default_prompt = _build_default_system_prompt(self, ctx, agent)
+                if default_prompt:
+                    effective_agent = agent.model_copy(update={"system_prompt": default_prompt})
+
+            self.bus.pm.hook.session_started(context=ctx, agent=effective_agent)
 
             if initial_text is not None:
                 ctx = ctx.append_message(Message(role=Role.USER, content=initial_text))
@@ -336,8 +430,8 @@ class Harness:
                 )
 
             steps = 0
-            while steps < agent.max_steps:
-                request = await self.build_request(ctx, agent)
+            while steps < effective_agent.max_steps:
+                request = await self.build_request(ctx, effective_agent)
                 resp, chunks = await self._stream_turn(ctx, request)
                 for chunk in chunks:
                     yield chunk
@@ -356,7 +450,7 @@ class Harness:
                         EventType.ASSISTANT_FINISHED.value, context=ctx, text=resp.content
                     )
                     break
-                if await self._should_stop(ctx, agent):
+                if await self._should_stop(ctx, effective_agent):
                     break
                 steps += 1
 
@@ -383,6 +477,9 @@ class Harness:
             model=agent.model,
             messages=tuple((*system, *ctx.messages)),
             temperature=agent.temperature,
+            tools=_tool_specs_to_openai_tools([
+                s for specs in self.bus.pm.hook.get_tool_specs(context=ctx) if specs for s in specs
+            ]),
         )
         # Allow plugins to intercept and transform the message list.
         modified = await _settle(
@@ -473,8 +570,19 @@ class Harness:
         for call in resp.tool_calls:
             spec = specs.get(call.tool_name)
             if spec is None:
+                error_result = ToolResult(
+                    tool_name=call.tool_name or "unknown",
+                    status=ToolResultStatus.ERROR,
+                    error=f"工具 '{call.tool_name}' 未注册或不存在。",
+                )
                 ctx = ctx.append_message(
-                    Message(role=Role.TOOL, name=call.tool_name, content="<unknown tool>")
+                    Message(role=Role.TOOL, name=call.tool_name or "unknown", content=error_result.error, tool_call_id=call.id)
+                )
+                await self.bus.aemit(
+                    EventType.TOOL_RESULT.value,
+                    context=ctx,
+                    tool=call.tool_name or "unknown",
+                    result=error_result,
                 )
                 continue
             # 1. Give plugins a chance to intercept before actual execution.
@@ -496,7 +604,7 @@ class Harness:
                     result=result,
                 )
             ctx = ctx.append_message(
-                Message(role=Role.TOOL, name=call.tool_name, content=str(result.output))
+                Message(role=Role.TOOL, name=call.tool_name, content=str(result.output), tool_call_id=call.id)
             )
         return ctx
 
@@ -604,7 +712,11 @@ class Harness:
 
         token = _subagent_depth.set(depth + 1)
         try:
-            async with open_session(namespace=self.config.namespace) as ctx:
+            parent = current_context()
+            ns = self.config.namespace
+            if parent is not None and parent.namespace.startswith("workflow-step:"):
+                ns = parent.namespace
+            async with open_session(namespace=ns) as ctx:
                 if spec.task:
                     ctx = ctx.append_message(Message(role=Role.USER, content=spec.task))
                 final = await asyncio.wait_for(

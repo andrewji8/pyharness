@@ -43,3 +43,10 @@ Thumbs.db
 .kilo/
 *.tar.gz
 *.whl
+
+# Environment / secrets
+.env
+*.npz
+pyharness_sessions.db
+fib.txt
+python313.md

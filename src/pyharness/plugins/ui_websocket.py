@@ -32,6 +32,7 @@ class WebSocketObserverPlugin:
             return
         await self.web_ui.broadcast(event.type, {
             "session_id": str(event.session_id),
+            "internal": context.namespace.startswith("workflow-step:"),
             **event.payload,
         })
 

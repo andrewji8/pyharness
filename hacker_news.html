@@ -1,0 +1,285 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Hacker News — Glassmorphism</title>
+  <style>
+    :root {
+      --bg-start: #0f172a;
+      --bg-end: #1e293b;
+      --glass-bg: rgba(255, 255, 255, 0.06);
+      --glass-border: rgba(255, 255, 255, 0.12);
+      --text-primary: #f1f5f9;
+      --text-secondary: #94a3b8;
+      --accent: #38bdf8;
+    }
+
+    * {
+      margin: 0;
+      padding: 0;
+      box-sizing: border-box;
+    }
+
+    body {
+      min-height: 100vh;
+      background: linear-gradient(135deg, var(--bg-start), var(--bg-end));
+      color: var(--text-primary);
+      font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+      padding: 40px 20px;
+      background-attachment: fixed;
+    }
+
+    .container {
+      max-width: 800px;
+      margin: 0 auto;
+    }
+
+    header {
+      text-align: center;
+      margin-bottom: 40px;
+    }
+
+    header h1 {
+      font-size: 2.5rem;
+      font-weight: 800;
+      background: linear-gradient(135deg, #38bdf8, #818cf8);
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      background-clip: text;
+      margin-bottom: 8px;
+    }
+
+    header p {
+      color: var(--text-secondary);
+      font-size: 0.95rem;
+    }
+
+    .card {
+      display: flex;
+      gap: 16px;
+      align-items: flex-start;
+      background: var(--glass-bg);
+      backdrop-filter: blur(16px);
+      -webkit-backdrop-filter: blur(16px);
+      border: 1px solid var(--glass-border);
+      border-radius: 16px;
+      padding: 20px 24px;
+      margin-bottom: 16px;
+      transition: transform 0.2s ease, box-shadow 0.2s ease;
+    }
+
+    .card:hover {
+      transform: translateY(-2px);
+      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.35);
+    }
+
+    .card-index {
+      font-size: 1.2rem;
+      font-weight: 700;
+      color: var(--accent);
+      min-width: 36px;
+      text-align: center;
+      line-height: 1;
+      padding-top: 4px;
+    }
+
+    .card-body {
+      flex: 1;
+      min-width: 0;
+    }
+
+    .card-title {
+      display: block;
+      font-size: 1rem;
+      font-weight: 600;
+      color: var(--text-primary);
+      text-decoration: none;
+      line-height: 1.45;
+      margin-bottom: 10px;
+      word-break: break-word;
+    }
+
+    .card-title:hover {
+      color: var(--accent);
+    }
+
+    .card-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 4px;
+      padding: 3px 10px;
+      border-radius: 999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.08);
+      color: var(--text-secondary);
+    }
+
+    .badge.score {
+      color: #fbbf24;
+      border-color: rgba(251, 191, 36, 0.2);
+      background: rgba(251, 191, 36, 0.08);
+    }
+
+    .badge.author {
+      color: #a5b4fc;
+      border-color: rgba(165, 180, 252, 0.2);
+      background: rgba(165, 180, 252, 0.08);
+    }
+
+    .badge.comments {
+      color: #86efac;
+      border-color: rgba(134, 239, 172, 0.2);
+      background: rgba(134, 239, 172, 0.08);
+    }
+
+    footer {
+      text-align: center;
+      margin-top: 40px;
+      color: var(--text-secondary);
+      font-size: 0.8rem;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Hacker News</h1>
+      <p>Top stories · Glassmorphism · Powered by PyHarness</p>
+    </header>
+    <main id="stories">
+      
+    <div class="card">
+      <div class="card-index">#1</div>
+      <div class="card-body">
+        <a class="card-title" href="https://lapcatsoftware.com/articles/2026/8/7.html" target="_blank" rel="noopener">hdiutil is deprecated in macOS 27 Golden Gate</a>
+        <div class="card-meta">
+          <span class="badge score">▲ 140</span>
+          <span class="badge author">@zdw</span>
+          <span class="badge comments">💬 45</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-index">#2</div>
+      <div class="card-body">
+        <a class="card-title" href="https://twitter.com/moxie/status/2091218652133732491" target="_blank" rel="noopener">Scrap</a>
+        <div class="card-meta">
+          <span class="badge score">▲ 195</span>
+          <span class="badge author">@tosh</span>
+          <span class="badge comments">💬 80</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-index">#3</div>
+      <div class="card-body">
+        <a class="card-title" href="https://mail-index.netbsd.org/netbsd-advocacy/2005/09/10/0000.html" target="_blank" rel="noopener">NetBSD and My Life (2005)</a>
+        <div class="card-meta">
+          <span class="badge score">▲ 68</span>
+          <span class="badge author">@gnyeki</span>
+          <span class="badge comments">💬 18</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-index">#4</div>
+      <div class="card-body">
+        <a class="card-title" href="https://forum.level1techs.com/t/why-your-local-llm-feels-dumber-than-it-is/253917" target="_blank" rel="noopener">Why your local LLM feels dumber than it is</a>
+        <div class="card-meta">
+          <span class="badge score">▲ 101</span>
+          <span class="badge author">@felineflock</span>
+          <span class="badge comments">💬 28</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-index">#5</div>
+      <div class="card-body">
+        <a class="card-title" href="https://quantumi.sh/public/labs.html" target="_blank" rel="noopener">ElevenLabs, TwelveLabs, ThirteenLabs</a>
+        <div class="card-meta">
+          <span class="badge score">▲ 271</span>
+          <span class="badge author">@jemoka</span>
+          <span class="badge comments">💬 89</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-index">#6</div>
+      <div class="card-body">
+        <a class="card-title" href="https://hister.org/" target="_blank" rel="noopener">Hister – A private, full content search index that you control</a>
+        <div class="card-meta">
+          <span class="badge score">▲ 181</span>
+          <span class="badge author">@auraham</span>
+          <span class="badge comments">💬 57</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-index">#7</div>
+      <div class="card-body">
+        <a class="card-title" href="https://bactra.org/reviews/wolfram/" target="_blank" rel="noopener">A New Kind of Science by Stephen Wolfram: Monster Raving Egomania</a>
+        <div class="card-meta">
+          <span class="badge score">▲ 7</span>
+          <span class="badge author">@maxall4</span>
+          <span class="badge comments">💬 1</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-index">#8</div>
+      <div class="card-body">
+        <a class="card-title" href="https://www.reuters.com/world/how-texas-student-blew-whistle-rogue-ai-hacking-attempt-2026-08-20/" target="_blank" rel="noopener">How a Texas student blew the whistle on a rogue AI hacking attempt</a>
+        <div class="card-meta">
+          <span class="badge score">▲ 82</span>
+          <span class="badge author">@olalonde</span>
+          <span class="badge comments">💬 15</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-index">#9</div>
+      <div class="card-body">
+        <a class="card-title" href="https://geometridae.bearblog.dev/a-friendly-introduction-to-racket/" target="_blank" rel="noopener">A Friendly Introduction to Racket</a>
+        <div class="card-meta">
+          <span class="badge score">▲ 168</span>
+          <span class="badge author">@signa11</span>
+          <span class="badge comments">💬 70</span>
+        </div>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="card-index">#10</div>
+      <div class="card-body">
+        <a class="card-title" href="https://www.rfcafe.com/" target="_blank" rel="noopener">RF Cafe</a>
+        <div class="card-meta">
+          <span class="badge score">▲ 115</span>
+          <span class="badge author">@gregsadetsky</span>
+          <span class="badge comments">💬 12</span>
+        </div>
+      </div>
+    </div>
+    </main>
+    <footer>
+      <p>Source: Hacker News API · Generated by PyHarness</p>
+    </footer>
+  </div>
+</body>
+</html>

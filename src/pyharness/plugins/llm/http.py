@@ -8,9 +8,17 @@ inside the network methods, so the package imports fine without it.
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
+import os
+import time
 from collections.abc import AsyncIterator
 from typing import Any
+
+logger = logging.getLogger("pyharness.llm.http")
+
+_LLM_DIRECT = os.environ.get("LLM_DIRECT") == "1"
 
 from pyharness.plugins.llm.provider import Provider
 from pyharness.schema import LLMRequest, LLMResponse, LLMStreamChunk, ToolCall
@@ -57,8 +65,37 @@ class HTTPProvider(Provider):
             headers["Authorization"] = f"Bearer {self.api_key}"
         return headers
 
+    @staticmethod
+    def _normalize_usage(usage: dict[str, Any]) -> dict[str, int]:
+        """Keep only scalar integer fields from provider usage payloads."""
+        normalized: dict[str, int] = {}
+        for key, value in (usage or {}).items():
+            if isinstance(value, int) and not isinstance(value, bool):
+                normalized[key] = value
+        return normalized
+
     def _messages_payload(self, request: LLMRequest) -> list[dict[str, Any]]:
-        return [{"role": m.role.value, "content": m.content} for m in request.messages]
+        messages: list[dict[str, Any]] = []
+        for m in request.messages:
+            msg: dict[str, Any] = {"role": m.role.value, "content": m.content}
+            if m.name:
+                msg["name"] = m.name
+            if m.tool_calls:
+                msg["tool_calls"] = [
+                    {
+                        "id": tc.id,
+                        "type": "function",
+                        "function": {
+                            "name": tc.tool_name,
+                            "arguments": json.dumps(tc.arguments) if not isinstance(tc.arguments, str) else tc.arguments,
+                        },
+                    }
+                    for tc in m.tool_calls
+                ]
+            if m.tool_call_id:
+                msg["tool_call_id"] = m.tool_call_id
+            messages.append(msg)
+        return messages
 
     @staticmethod
     def _tool_calls(items: list[dict[str, Any]] | None) -> tuple[ToolCall, ...]:
@@ -84,8 +121,14 @@ class HTTPProvider(Provider):
         }
         if request.max_tokens:
             payload["max_tokens"] = request.max_tokens
+        if request.tools:
+            payload["tools"] = request.tools
 
-        async with httpx.AsyncClient(timeout=self.timeout, transport=self._transport) as client:
+        async with httpx.AsyncClient(
+            timeout=self.timeout,
+            transport=self._transport,
+            trust_env=not _LLM_DIRECT,
+        ) as client:
             response = await client.post(
                 f"{self.base_url}/chat/completions",
                 headers=self._request_headers(),
@@ -94,12 +137,15 @@ class HTTPProvider(Provider):
             response.raise_for_status()
             data: dict[str, Any] = response.json()
 
-        message = data["choices"][0]["message"]
+        choices = data.get("choices") or []
+        if not choices:
+            return LLMResponse(model=request.model, content="", tool_calls=(), usage={})
+        message = choices[0].get("message", {})
         return LLMResponse(
             model=request.model,
             content=message.get("content") or "",
             tool_calls=self._tool_calls(message.get("tool_calls")),
-            usage=data.get("usage", {}),
+            usage=self._normalize_usage(data.get("usage", {})),
         )
 
     # -- streaming ---------------------------------------------------------- #
@@ -114,29 +160,55 @@ class HTTPProvider(Provider):
         }
         if request.max_tokens:
             payload["max_tokens"] = request.max_tokens
+        if request.tools:
+            payload["tools"] = request.tools
 
         assembler = _StreamToolAssembler()
-        async with httpx.AsyncClient(timeout=self.timeout, transport=self._transport) as client:
-            async with client.stream(
-                "POST",
-                f"{self.base_url}/chat/completions",
-                headers=self._request_headers(),
-                json=payload,
-            ) as response:
-                response.raise_for_status()
-                async for raw in response.aiter_lines():
-                    if not raw.startswith("data:"):
-                        continue
-                    datum = raw[5:].strip()
-                    if not datum or datum == "[DONE]":
-                        break
-                    obj = json.loads(datum)
-                    delta = obj["choices"][0]["delta"]
-                    delta_content = delta.get("content")
-                    if delta_content:
-                        yield LLMStreamChunk(delta=delta_content)
-                    for call in assembler.take(delta.get("tool_calls")):
-                        yield LLMStreamChunk(delta="", tool_calls=(call,))
+        max_retries = 3
+        for attempt in range(max_retries):
+            try:
+                async with httpx.AsyncClient(
+                    timeout=self.timeout,
+                    transport=self._transport,
+                    trust_env=not _LLM_DIRECT,
+                ) as client:
+                    async with client.stream(
+                        "POST",
+                        f"{self.base_url}/chat/completions",
+                        headers=self._request_headers(),
+                        json=payload,
+                    ) as response:
+                        response.raise_for_status()
+                        async for raw in response.aiter_lines():
+                            if not raw.startswith("data:"):
+                                continue
+                            datum = raw[5:].strip()
+                            if not datum or datum == "[DONE]":
+                                break
+                            obj = json.loads(datum)
+                            choices = obj.get("choices") or []
+                            if not choices:
+                                continue
+                            delta = choices[0].get("delta", {})
+                            delta_content = delta.get("content")
+                            if delta_content:
+                                yield LLMStreamChunk(delta=delta_content)
+                            for call in assembler.take(delta.get("tool_calls")):
+                                yield LLMStreamChunk(delta="", tool_calls=(call,))
+                return
+            except (
+                httpx.RemoteProtocolError,
+                httpx.ReadError,
+                httpx.ConnectError,
+                httpx.ReadTimeout,
+            ) as exc:
+                if attempt < max_retries - 1:
+                    backoff = 2 ** attempt
+                    logger.warning("stream attempt %d failed: %s, retrying in %ds", attempt + 1, exc, backoff)
+                    await asyncio.sleep(backoff)
+                    continue
+                logger.error("stream failed after %d attempts: %s", max_retries, exc)
+                raise
 
 
 class _StreamToolAssembler:

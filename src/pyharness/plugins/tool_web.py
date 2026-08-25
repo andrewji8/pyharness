@@ -7,10 +7,9 @@ extraction.
 Tools
 -----
 * ``web_fetch(url)`` — fetch a URL and return its text content.
-* ``web_search(query)`` — [实验性] search the web using DuckDuckGo HTML (no
-  API key required) and return the top results. This tool depends on DDG's
-  HTML structure and may break without notice; prefer ``web_fetch`` when
-  you know the target URL.
+* ``web_search(query)`` — search the web using Tavily Search API and return
+  the top results with an AI summary. Requires ``TAVILY_API_KEY`` environment
+  variable.
 
 Dependencies
 ------------
@@ -22,12 +21,13 @@ Dependencies
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 from pluggy import HookimplMarker
 
 from pyharness.context import SessionContext
-from pyharness.schema import ToolArg, ToolResult, ToolResultStatus
+from pyharness.schema import ToolArg, ToolResult, ToolResultStatus, ToolSpec
 
 logger = logging.getLogger(__name__)
 hookimpl = HookimplMarker("pyharness")
@@ -104,9 +104,8 @@ class WebPlugin:
         return ToolSpec(
             name="web_search",
             description=(
-                "[实验性] 使用 DuckDuckGo HTML 搜索网页并返回前 5 条结果摘要。"
-                " 注意：此工具依赖 DDG 网页结构，可能不稳定；"
-                " 建议优先使用 web_fetch 直接访问已知 URL。"
+                "使用 Tavily Search API 搜索网页并返回前 5 条结果摘要。"
+                "需要环境变量 TAVILY_API_KEY。"
             ),
             parameters=(
                 ToolArg(name="query", type="string", description="搜索关键词", required=True),
@@ -165,39 +164,66 @@ class WebPlugin:
                 tool_name="web_fetch", status=ToolResultStatus.ERROR, error=f"HTTP {exc.response.status_code}: {exc.response.reason_phrase}", output={"url": url}
             )
         except httpx.TimeoutException:
-            return ToolResult(tool_name="web_fetch", status=ToolResultStatus.ERROR, error="请求超时。", output={"url": url})
+            return ToolResult(tool_name="web_fetch", status=ToolResultStatus.ERROR, error="请求超时。可能是网络不稳定或目标服务器响应缓慢。", output={"url": url})
         except Exception as exc:
             logger.exception("web_fetch failed")
-            return ToolResult(tool_name="web_fetch", status=ToolResultStatus.ERROR, error=str(exc), output={"url": url})
+            return ToolResult(tool_name="web_fetch", status=ToolResultStatus.ERROR, error=f"抓取失败: {exc}", output={"url": url})
 
     # ------------------------------------------------------------------ #
-    # web_search
+    # web_search (Tavily)
     # ------------------------------------------------------------------ #
     async def _search(self, arguments: dict[str, object]) -> ToolResult:
         query = str(arguments.get("query", ""))
         if not query:
             return ToolResult(tool_name="web_search", status=ToolResultStatus.ERROR, error="缺少 'query' 参数。", output={})
 
-        # DuckDuckGo HTML endpoint: no API key required.
-        ddg_url = "https://html.duckduckgo.com/html/"
-        params = {"q": query}
+        api_key = os.getenv("TAVILY_API_KEY", "")
+        if not api_key:
+            return ToolResult(
+                tool_name="web_search",
+                status=ToolResultStatus.ERROR,
+                error="错误: 未配置 TAVILY_API_KEY（请写入 .env）",
+                output={"query": query},
+            )
+
         try:
-            async with httpx.AsyncClient(
-                follow_redirects=True,
-                timeout=self.timeout,
-                headers={"User-Agent": self.user_agent},
-            ) as client:
-                resp = await client.post(ddg_url, data=params)
-                resp.raise_for_status()
-                results = self._parse_ddg(resp.text)
-                return ToolResult(
-                    tool_name="web_search",
-                    status=ToolResultStatus.OK,
-                    output={"query": query, "results": results, "count": len(results)},
+            async with httpx.AsyncClient(timeout=httpx.Timeout(15.0)) as client:
+                resp = await client.post(
+                    "https://api.tavily.com/search",
+                    headers={"Authorization": f"Bearer {api_key}"},
+                    json={
+                        "query": query,
+                        "search_depth": "basic",
+                        "max_results": 5,
+                        "include_answer": True,
+                    },
                 )
+                resp.raise_for_status()
+                data = resp.json()
         except Exception as exc:
-            logger.exception("web_search failed")
-            return ToolResult(tool_name="web_search", status=ToolResultStatus.ERROR, error=str(exc), output={"query": query})
+            return ToolResult(
+                tool_name="web_search",
+                status=ToolResultStatus.ERROR,
+                error=f"Tavily 搜索失败: {type(exc).__name__}: {exc}",
+                output={"query": query},
+            )
+
+        results = data.get("results") or []
+        parts = []
+        if data.get("answer"):
+            parts.append(f"【AI 摘要】{data['answer']}")
+        for i, r in enumerate(results, 1):
+            parts.append(
+                f"{i}. {r.get('title', '')}\n"
+                f"   {r.get('url', '')}\n"
+                f"   {(r.get('content') or '')[:300]}"
+            )
+        output_text = "\n\n".join(parts) if parts else "未找到相关结果"
+        return ToolResult(
+            tool_name="web_search",
+            status=ToolResultStatus.OK,
+            output={"query": query, "results": results, "count": len(results), "text": output_text},
+        )
 
     # ------------------------------------------------------------------ #
     # Helpers
@@ -229,25 +255,6 @@ class WebPlugin:
         if match:
             return match.group(1).strip()
         return ""
-
-    @staticmethod
-    def _parse_ddg(html: str) -> list[dict[str, str]]:
-        """Parse DuckDuckGo HTML results into a list of {title, url, snippet}."""
-        import re
-
-        results: list[dict[str, str]] = []
-        # Each result is roughly in a <a class="result__a" href="...">...</a>
-        # followed by a <a class="result__snippet">...</a>
-        title_links = re.findall(r'<a[^>]+class="result__a"[^>]*href="([^"]+)"[^>]*>(.*?)</a>', html, re.IGNORECASE | re.DOTALL)
-        snippets = re.findall(r'<a[^>]+class="result__snippet"[^>]*>(.*?)</a>', html, re.IGNORECASE | re.DOTALL)
-
-        for i, (url, title_html) in enumerate(title_links):
-            if i >= 10:
-                break
-            title = re.sub(r"<[^>]+>", "", title_html).strip()
-            snippet = re.sub(r"<[^>]+>", "", snippets[i]).strip() if i < len(snippets) else ""
-            results.append({"title": title, "url": url, "snippet": snippet})
-        return results
 
 
 __all__ = ["WebPlugin"]

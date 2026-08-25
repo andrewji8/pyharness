@@ -118,12 +118,28 @@ class WebUIPlugin:
     # ------------------------------------------------------------------
     # REST API handlers
     # ------------------------------------------------------------------
+    async def _get_model(self, requested: str | None = None) -> str:
+        """Resolve the best available model name."""
+        providers = await _settle(
+            self.harness.bus.pm.hook.get_llm_providers(context=None)
+        )
+        models: list[str] = []
+        for value in providers:
+            if value is not None:
+                models.extend(value if isinstance(value, tuple) else (value,))
+        if not models:
+            return requested or "default"
+        if requested and requested in models:
+            return requested
+        return models[0]
+
     async def _chat(self, request: ChatRequest) -> dict[str, Any]:
         """发送消息并启动 Agent Loop（非流式，返回最终结果）。"""
         if self.harness is None:
             return {"error": "Harness 未初始化"}
 
-        agent = AgentConfig(name="web-chat", model=request.model or "default")
+        model = await self._get_model(request.model)
+        agent = AgentConfig(name="web-chat", model=model)
         try:
             ctx = await self.harness.run_session(
                 agent=agent,
@@ -246,8 +262,9 @@ class WebUIPlugin:
 
                     content = msg.get("content", "")
                     session_id = msg.get("session_id")
+                    model = msg.get("model")
                     current_task = asyncio.create_task(
-                        self._run_stream_session(session_id, content)
+                        self._run_stream_session(session_id, content, model=model)
                     )
 
                 elif msg_type == "cancel":
@@ -268,13 +285,14 @@ class WebUIPlugin:
             if current_task is not None and not current_task.done():
                 current_task.cancel()
 
-    async def _run_stream_session(self, session_id: str | None, content: str) -> None:
+    async def _run_stream_session(self, session_id: str | None, content: str, model: str | None = None) -> None:
         """在后台运行流式会话，将 LLM 分片直接推送给前端。"""
         if self.harness is None:
             await self.broadcast("error", {"message": "Harness 未初始化"})
             return
 
-        agent = AgentConfig(name="web-chat", model="default")
+        resolved_model = await self._get_model(model)
+        agent = AgentConfig(name="web-chat", model=resolved_model)
         try:
             async for chunk in self.harness.stream_session(
                 agent=agent,
@@ -302,7 +320,40 @@ class WebUIPlugin:
         """向所有 WebSocket 客户端广播事件。"""
         if not self.ws_clients:
             return
-        message = json.dumps({"type": event, "data": data}, ensure_ascii=False)
+
+        def _json_default(o: Any) -> Any:
+            if hasattr(o, "model_dump"):
+                return o.model_dump(mode="json")
+            if hasattr(o, "to_text"):
+                return o.to_text()
+            if isinstance(o, type(uuid.UUID)):
+                return str(o)
+            if hasattr(o, "value"):
+                return o.value
+            return str(o)
+
+        def _serialize(obj: Any) -> Any:
+            if hasattr(obj, "model_dump"):
+                return obj.model_dump(mode="json")
+            if hasattr(obj, "to_text"):
+                return obj.to_text()
+            if hasattr(obj, "value"):
+                return obj.value
+            if isinstance(obj, dict):
+                return {k: _serialize(v) for k, v in obj.items()}
+            if isinstance(obj, (list, tuple)):
+                return [_serialize(v) for v in obj]
+            if isinstance(obj, uuid.UUID):
+                return str(obj)
+            return obj
+
+        try:
+            payload = _serialize(data)
+            message = json.dumps({"type": event, "data": payload}, ensure_ascii=False, default=_json_default)
+        except Exception as exc:
+            logger.error("broadcast serialization failed: %s", exc, exc_info=True)
+            return
+
         disconnected: set[WebSocket] = set()
         for ws in self.ws_clients:
             try:
@@ -328,8 +379,18 @@ class WebUIPlugin:
 def serve(harness: Any, host: str = "127.0.0.1", port: int = 3080) -> None:
     """启动 Web UI 服务。"""
     import uvicorn
+    from pyharness.plugins.tool_web import WebPlugin
     from pyharness.plugins.ui_websocket import WebSocketObserverPlugin
+    from pyharness.plugins.tool_fs import FileSystemPlugin
+    from pyharness.plugins.workflow import WorkflowPlugin
+    from pyharness.plugins.tool_subagent import SubagentToolPlugin
+    from pyharness.plugins.session_store import SQLiteSessionStorePlugin
 
+    harness.register_plugin(WebPlugin())
+    harness.register_plugin(FileSystemPlugin())
+    harness.register_plugin(WorkflowPlugin())
+    harness.register_plugin(SubagentToolPlugin())
+    harness.register_plugin(SQLiteSessionStorePlugin())
     plugin = WebUIPlugin(host=host, port=port)
     harness.register_plugin(plugin)
     harness.register_plugin(WebSocketObserverPlugin(plugin))

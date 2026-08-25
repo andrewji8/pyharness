@@ -70,6 +70,19 @@ def _configure_provider(
 
 def _harness(verbose: bool) -> Harness:
     harness = Harness()  # auto-loads builtin + llm entry-points
+    from pyharness.plugins.tool_web import WebPlugin
+    from pyharness.plugins.tool_fs import FileSystemPlugin
+    from pyharness.plugins.workflow import WorkflowPlugin
+    from pyharness.plugins.tool_subagent import SubagentToolPlugin
+    from pyharness.plugins.session_store import SQLiteSessionStorePlugin
+    from pyharness.plugins.guard_approval import ApprovalGuardPlugin
+
+    harness.register_plugin(WebPlugin())
+    harness.register_plugin(FileSystemPlugin())
+    harness.register_plugin(WorkflowPlugin())
+    harness.register_plugin(SubagentToolPlugin())
+    harness.register_plugin(SQLiteSessionStorePlugin())
+    harness.register_plugin(ApprovalGuardPlugin())
     if verbose:
         harness.bus.register(CliObserver())
     return harness

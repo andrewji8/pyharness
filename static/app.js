@@ -85,6 +85,7 @@
 
         switch (eventType) {
             case 'user.message':
+                if (data.internal) break;
                 appendUserMessage(data.text || '');
                 break;
 
@@ -101,6 +102,7 @@
                 break;
 
             case 'llm_stream_chunk':
+                if (data.internal) break;
                 handleStreamChunk(data);
                 break;
 
@@ -266,7 +268,7 @@
             const icon = getStepIcon(step.status);
             div.innerHTML = `
                 <span class="plan-step-icon">${icon}</span>
-                <span class="plan-step-title">${escapeHtml(step.title || step.id)}</span>
+                <span class="plan-step-title">${escapeHtml(step.title || step.description || step.id)}</span>
                 <span class="plan-step-status ${step.status}">${step.status}</span>
             `;
             dom.planSteps.appendChild(div);

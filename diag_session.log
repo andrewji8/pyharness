@@ -1,0 +1,7 @@
+[+  0.12s] 配置 dummy provider
+[+  0.12s] 构建 _harness()
+[+  0.31s] harness 就绪，枚举 get_tool_specs
+[+   0.0s]   get_tool_specs -> 11 工具: ['echo', 'fs_list', 'fs_read', 'fs_write', 'get_plan_status', 'memory_search', 'spawn_subagents', 'update_plan', 'web_fetch', 'web_search', 'workflow_execute']
+[+  0.33s] 开始 run_session
+[+  0.03s]   run_session -> 2 msgs in 0.03s
+[+  0.36s] 完成

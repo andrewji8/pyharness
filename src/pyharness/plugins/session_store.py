@@ -25,6 +25,7 @@ import json
 import logging
 import time
 import uuid
+from datetime import datetime, timezone
 from typing import Any, Sequence
 
 from pluggy import HookimplMarker
@@ -211,9 +212,9 @@ class SQLiteSessionStorePlugin:
                             session_id=uuid.UUID(sid),
                             namespace=row["namespace"],
                             messages=tuple(messages),
-                            memory=json.loads(row.get("metadata") or "{}"),
-                            created_at=datetime.datetime.fromtimestamp(
-                                row["created_at"], tz=datetime.timezone.utc
+                            memory=json.loads(row["metadata"] or "{}"),
+                            created_at=datetime.fromtimestamp(
+                                row["created_at"], tz=timezone.utc
                             ),
                         )
                     )

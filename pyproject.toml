@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pyharness-ai"
-version = "0.6.2"
+version = "0.7.0"
 description = "PyHarness: Everything is a Plugin. A Python Agent Framework."
 readme = "README.md"
 license = {text = "MIT"}

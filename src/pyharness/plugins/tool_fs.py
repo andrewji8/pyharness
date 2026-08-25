@@ -27,7 +27,7 @@ from typing import Any
 from pluggy import HookimplMarker
 
 from pyharness.context import SessionContext
-from pyharness.schema import ToolArg, ToolResult, ToolResultStatus
+from pyharness.schema import ToolArg, ToolResult, ToolResultStatus, ToolSpec
 
 logger = logging.getLogger(__name__)
 hookimpl = HookimplMarker("pyharness")

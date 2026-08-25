@@ -214,5 +214,32 @@ async def test_stream_session_continues_on_reversible_lineage() -> None:
     assert roles == [Role.USER, Role.ASSISTANT, Role.USER, Role.ASSISTANT]
 
 
+async def test_run_session_executes_tool_calls_and_appends_tool_message() -> None:
+    """Full chain: LLM returns tool_calls -> engine executes tool -> result appended."""
+    llm.clear()
+    plan = [
+        LLMResponse(
+            model="dummy",
+            content="",
+            tool_calls=(ToolCall(id="c1", tool_name="echo", arguments={"text": "tool-result"}),),
+        ),
+        LLMResponse(model="dummy", content="final reply"),
+    ]
+    llm.use_dummy(models=("dummy",), plan=plan, chunk_size=2)
+    h = _harness(EchoToolPlugin())
+
+    await h.run_session(AgentConfig(name="a", model="dummy"), initial_text="ping")
+
+    assert h.last_context is not None
+    roles = [m.role for m in h.last_context.messages]
+    assert Role.TOOL in roles, f"Expected TOOL message in {roles}"
+    tool_msgs = [m for m in h.last_context.messages if m.role == Role.TOOL]
+    assert len(tool_msgs) == 1
+    assert "tool-result" in tool_msgs[0].content
+    assert h.last_context.last_message is not None
+    assert h.last_context.last_message.role == Role.ASSISTANT
+    assert h.last_context.last_message.content == "final reply"
+
+
 async def _collect(agen):
     return [c async for c in agen]

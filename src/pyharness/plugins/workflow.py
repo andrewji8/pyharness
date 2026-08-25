@@ -8,8 +8,8 @@ Design
 ------
 * The plugin captures the harness reference via ``harness_initialized`` so it
   can delegate to ``Harness.run_session`` for each step.
-* Planning uses the LLM directly via the ``llm_complete`` hook with a
-  structured prompt that asks for JSON output.
+    * Planning uses the LLM directly via ``stream_session`` with a
+      structured prompt that asks for JSON output.
 * Execution respects step dependencies (topological order) and supports
   retries for failed steps.
 * Each step runs in its own isolated session context via ``run_session``,
@@ -145,6 +145,7 @@ class WorkflowPlugin:
                 plan_status=plan.status,
                 step_count=len(plan.steps),
                 progress=plan.progress,
+                steps=[s.model_dump(mode="json") for s in plan.steps],
             )
         except Exception:
             pass
@@ -303,6 +304,16 @@ class WorkflowPlugin:
         if not isinstance(model, str):
             model = "default"
 
+        providers = await _settle(
+            self.harness.bus.pm.hook.get_llm_providers(context=context)
+        )
+        available_models: list[str] = []
+        for value in providers:
+            if value is not None:
+                available_models.extend(value if isinstance(value, tuple) else (value,))
+        if model not in available_models and available_models:
+            model = available_models[0]
+
         if self.harness is None:
             return ToolResult(
                 tool_name="workflow_execute",
@@ -313,7 +324,9 @@ class WorkflowPlugin:
 
         try:
             plan = await self._generate_plan(context, task, model)
+            logger.info("[workflow] plan parsed: id=%s task=%s steps=%d", plan.plan_id, plan.task, len(plan.steps))
             result = await self._execute_plan(context, plan, model)
+            logger.info("[workflow] plan finished: id=%s status=%s", plan.plan_id, result.get("status"))
             return ToolResult(
                 tool_name="workflow_execute",
                 status=ToolResultStatus.OK,
@@ -516,15 +529,6 @@ class WorkflowPlugin:
 
         return None
 
-    async def _complete_llm(self, context: SessionContext, request: LLMRequest) -> LLMResponse | None:
-        """Call the ``llm_complete`` hook; return the first non-None response."""
-        for value in await _settle(
-            self.harness.bus.pm.hook.llm_complete(context=context, request=request)
-        ):
-            if value is not None:
-                return LLMResponse.model_validate(value)
-        return None
-
     async def _generate_plan(self, context: SessionContext, task: str, model: str) -> WorkflowPlan:
         """Ask the LLM to produce a structured JSON plan for the task."""
         prompt = (
@@ -548,13 +552,19 @@ class WorkflowPlugin:
             messages=(Message(role=Role.USER, content=prompt),),
         )
 
-        resp = await self._complete_llm(context, request)
-        if resp is None:
+        resp_content = ""
+        async for chunk in self.harness.stream_session(
+            AgentConfig(name="workflow-plan", model=model),
+            initial_text=prompt,
+        ):
+            resp_content += chunk.delta
+
+        if not resp_content.strip():
             raise RuntimeError("No LLM provider available for plan generation")
 
-        plan_data = self._extract_json(resp.content)
+        plan_data = self._extract_json(resp_content)
         if not isinstance(plan_data, list):
-            raise RuntimeError(f"Expected JSON array from LLM, got: {resp.content[:200]}")
+            raise RuntimeError(f"Expected JSON array from LLM, got: {resp_content[:200]}")
 
         steps: list[WorkflowStep] = []
         for step_data in plan_data:
@@ -572,6 +582,8 @@ class WorkflowPlugin:
         await _settle(
             self.harness.bus.pm.hook.on_plan_created(plan=plan)
         )
+        await self._broadcast_plan_event(plan, "plan_created")
+        logger.info("[workflow] plan parsed: id=%s task=%s steps=%d", plan.plan_id, plan.task, len(plan.steps))
         return plan
 
     @staticmethod
@@ -606,6 +618,7 @@ class WorkflowPlugin:
         original_status = {s.id: s.status for s in plan.steps}
         original_steps = {s.id: s for s in plan.steps}
 
+        logger.info("[workflow] plan=%s start executing %d steps", plan.plan_id, len(plan.steps))
         await self._broadcast_plan_event(plan, "plan_created")
 
         while remaining:
@@ -629,6 +642,7 @@ class WorkflowPlugin:
                 break
 
             remaining = [s for s in remaining if s not in ready]
+            logger.info("[workflow] plan=%s ready batch: %s", plan.plan_id, [s.id for s in ready])
 
             running_batch: list[WorkflowStep] = []
             for step in ready:
@@ -638,6 +652,7 @@ class WorkflowPlugin:
                     self.harness.bus.pm.hook.on_step_update(plan_id=str(plan.plan_id), step=step)
                 )
                 await self._broadcast_step_event(plan, step, "plan_step_start")
+                logger.info("[workflow] plan=%s step=%s -> running", plan.plan_id, step.id)
 
             batch_results: dict[str, WorkflowStep] = {}
             async with asyncio.TaskGroup() as tg:
@@ -666,6 +681,7 @@ class WorkflowPlugin:
         )
         await self._broadcast_plan_event(completed_plan, "plan_completed")
         await self._persist_plan(completed_plan)
+        logger.info("[workflow] plan=%s finished status=%s", completed_plan.plan_id, plan_status)
 
         all_steps: dict[str, WorkflowStep] = {**original_steps, **results}
         return {
@@ -695,39 +711,20 @@ class WorkflowPlugin:
                 await self._broadcast_step_event(plan, step, "plan_step_retry")
 
             try:
-                if step.use_subagent:
-                    subagent_tools: list[ToolSpec] = []
-                    for plugin_specs in self.harness.bus.pm.hook.get_tool_specs(context=context):
-                        subagent_tools.extend(plugin_specs)
-                    sub_result = await self.harness.spawn_subagent(
-                        spec=SubagentSpec(
-                            name=step.id,
-                            task=step.description,
-                            model=model,
-                            max_turns=step.subagent_max_turns,
-                            timeout=step.subagent_timeout,
-                        ),
-                        parent_tools=subagent_tools,
-                        parent_config=AgentConfig(name="workflow", model=model),
-                    )
-                    if sub_result.status == "ok":
-                        step = step.model_copy(update={
-                            "result": sub_result.output or "",
-                            "status": StepStatus.COMPLETED,
-                        })
-                    else:
-                        step = step.model_copy(update={
-                            "error": sub_result.error,
-                            "status": StepStatus.FAILED,
-                        })
-                else:
-                    step_ctx = await self.harness.run_session(
-                        AgentConfig(name=step.id, model=model, max_steps=5),
-                        initial_text=step.description,
-                    )
+                output, error, status = await asyncio.wait_for(
+                    self._run_step_isolated(context, plan, step, model),
+                    timeout=120.0,
+                )
+                if status == StepStatus.COMPLETED:
                     step = step.model_copy(update={
-                        "result": step_ctx.last_message.content if step_ctx.last_message else "",
+                        "result": output or "",
                         "status": StepStatus.COMPLETED,
+                        "error": None,
+                    })
+                else:
+                    step = step.model_copy(update={
+                        "error": error or "step failed",
+                        "status": StepStatus.FAILED,
                     })
 
                 duration = time.monotonic() - start_time
@@ -737,19 +734,85 @@ class WorkflowPlugin:
                 )
                 await self._broadcast_step_event(plan, step, "plan_step_complete")
                 break
-            except Exception as exc:
-                if attempt < max_retries:
-                    continue
-                step = step.model_copy(update={"error": str(exc), "status": StepStatus.FAILED})
+            except asyncio.TimeoutError:
                 duration = time.monotonic() - start_time
-                step = step.model_copy(update={"duration_seconds": round(duration, 2)})
+                step = step.model_copy(update={
+                    "error": f"步骤超时（120s）",
+                    "status": StepStatus.FAILED,
+                    "duration_seconds": round(duration, 2),
+                })
                 await _settle(
                     self.harness.bus.pm.hook.on_step_update(plan_id=str(plan.plan_id), step=step)
                 )
                 await self._broadcast_step_event(plan, step, "plan_step_complete")
+                logger.warning("[workflow] plan=%s step=%s TIMEOUT after 120s", plan.plan_id, step.id)
+                break
+            except Exception as exc:
+                if attempt < max_retries:
+                    continue
+                duration = time.monotonic() - start_time
+                step = step.model_copy(update={"error": str(exc), "status": StepStatus.FAILED, "duration_seconds": round(duration, 2)})
+                await _settle(
+                    self.harness.bus.pm.hook.on_step_update(plan_id=str(plan.plan_id), step=step)
+                )
+                await self._broadcast_step_event(plan, step, "plan_step_complete")
+                logger.exception("[workflow] plan=%s step=%s ERROR", plan.plan_id, step.id)
 
         step = step.model_copy(update={"finished_at": _utc_now()})
         results[step.id] = step
+
+    async def _run_step_isolated(
+        self,
+        parent_ctx: SessionContext,
+        plan: WorkflowPlan,
+        step: WorkflowStep,
+        model: str,
+    ) -> tuple[str | None, str | None, StepStatus]:
+        """Run a single workflow step inside a brand-new session scope.
+
+        ``open_session`` resets the task-scoped ``ContextVar`` so nested
+        ``run_session`` / ``spawn_subagent`` calls cannot re-enter the outer
+        session's asyncio locks. This prevents the deadlock observed when a
+        workflow step tried to acquire the parent session's lock.
+        """
+        from pyharness.context import open_session
+
+        logger.info("[workflow] plan=%s step=%s -> isolated run started", plan.plan_id, step.id)
+        async with open_session(namespace=f"workflow-step:{step.id}") as step_ctx:
+            if step.use_subagent:
+                spec = SubagentSpec(
+                    name=step.id,
+                    task=step.description,
+                    model=model,
+                    max_turns=step.subagent_max_turns,
+                    timeout=step.subagent_timeout,
+                )
+                result = await self.harness.spawn_subagent(
+                    spec,
+                    parent_tools=list(
+                        s
+                        for specs in self.harness.bus.pm.hook.get_tool_specs(context=parent_ctx)
+                        if specs
+                        for s in specs
+                    ),
+                    parent_config=AgentConfig(name="workflow", model=model),
+                )
+                ok = result.status == "ok"
+                logger.info("[workflow] plan=%s step=%s subagent done status=%s", plan.plan_id, step.id, result.status)
+                return (
+                    result.output or "",
+                    result.error,
+                    StepStatus.COMPLETED if ok else StepStatus.FAILED,
+                )
+
+            session = await self.harness.run_session(
+                AgentConfig(name=step.id, model=model, max_steps=5),
+                initial_text=step.description,
+                namespace=f"workflow-step:{step.id}",
+            )
+            last = session.messages[-1] if session.messages else None
+            logger.info("[workflow] plan=%s step=%s run_session done", plan.plan_id, step.id)
+            return ((last.content if last else "") or "", None, StepStatus.COMPLETED)
 
     def _extract_json(self, text: str) -> Any:
         """Extract JSON from LLM response text."""
