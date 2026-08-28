@@ -19,6 +19,7 @@ from pyharness.plugins.tool_subagent import SubagentToolPlugin
 from pyharness.schema import (
     AgentConfig,
     HarnessConfig,
+    LLMRequest,
     LLMResponse,
     Message,
     Role,
@@ -176,6 +177,68 @@ async def test_spawn_subagents_validates_input() -> None:
     result = next((r for r in await _settle(raw) if r is not None), None)
     assert result is not None
     assert result.status.value == "error"
+
+
+async def test_subagent_inherits_parent_tools() -> None:
+    """Subagent LLM request should include parent_tools (not an empty list)."""
+    llm.clear()
+    llm.use_dummy(models=("dummy",), plan=[LLMResponse(model="dummy", content="done")])
+    h = Harness(config=HarnessConfig(auto_load_entry_points=False))
+    h.register_plugin(llm)
+    h.initialize()
+
+    parent_tool = ToolSpec(name="python_exec", description="Run Python", parameters=())
+    captured_requests: list[LLMRequest] = []
+
+    class CaptureLLM:
+        @hookimpl
+        async def llm_complete(self, context: SessionContext, request: LLMRequest):
+            captured_requests.append(request)
+            return LLMResponse(model=request.model, content="done")
+
+    h.register_plugin(CaptureLLM())
+
+    spec = SubagentSpec(name="worker", task="do math", model="dummy", max_turns=2, timeout=120.0)
+    result = await h.spawn_subagent(
+        spec,
+        parent_tools=[parent_tool],
+        parent_config=AgentConfig(name="parent", model="dummy"),
+    )
+    assert result.status == "ok"
+    assert len(captured_requests) >= 1
+    tool_names = [t["function"]["name"] for r in captured_requests for t in (r.tools or [])]
+    assert "python_exec" in tool_names
+
+
+async def test_subagent_empty_allowed_tools_inherits_all() -> None:
+    """When allowed_tools is an empty list, subagent should still inherit all parent_tools."""
+    llm.clear()
+    llm.use_dummy(models=("dummy",), plan=[LLMResponse(model="dummy", content="done")])
+    h = Harness(config=HarnessConfig(auto_load_entry_points=False))
+    h.register_plugin(llm)
+    h.initialize()
+
+    parent_tool = ToolSpec(name="python_exec", description="Run Python", parameters=())
+    captured_requests: list[LLMRequest] = []
+
+    class CaptureLLM:
+        @hookimpl
+        async def llm_complete(self, context: SessionContext, request: LLMRequest):
+            captured_requests.append(request)
+            return LLMResponse(model=request.model, content="done")
+
+    h.register_plugin(CaptureLLM())
+
+    spec = SubagentSpec(name="worker", task="do math", model="dummy", max_turns=2, timeout=120.0, allowed_tools=[])
+    result = await h.spawn_subagent(
+        spec,
+        parent_tools=[parent_tool],
+        parent_config=AgentConfig(name="parent", model="dummy"),
+    )
+    assert result.status == "ok"
+    assert len(captured_requests) >= 1
+    tool_names = [t["function"]["name"] for r in captured_requests for t in (r.tools or [])]
+    assert "python_exec" in tool_names
 
 
 if __name__ == "__main__":

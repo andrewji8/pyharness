@@ -155,14 +155,157 @@ asyncio.run(main())
 
 ---
 
+## 🛡️ Security Model
+
+PyHarness is built to run untrusted agent workloads without exposing the host.
+
+### Code Sandbox (fail-closed)
+`python_exec` runs in a locked-down Docker container by default:
+
+```bash
+# Pull the sandbox image once
+pyharness sandbox init
+
+# Run with the Docker sandbox
+PYHARNESS_SANDBOX=docker pyharness run -m deepseek-chat -i "sort a 10GB list"
+```
+
+Container hardening (`python:3.11-slim`):
+
+| Flag | Effect |
+|------|--------|
+| `--network none` | No outbound network — SSRF/ exfiltration surface removed |
+| `--read-only` + `--tmpfs /tmp` | Immutable root FS |
+| `--memory 256m --memory-swap 256m` | Hard memory cap |
+| `--cpus 0.5 --pids-limit 64` | CPU & process caps |
+| `--rm` | Container destroyed after each run |
+
+If Docker is unavailable or the image is missing, the executor **fails closed**
+(refuses to execute) rather than silently running on the host.
+
+### SSRF Protection
+`tool-web` resolves the target host and rejects requests to loopback
+(`127.0.0.0/8`, `::1`), link-local (`169.254.0.0/16`), and private ranges
+unless an allow-list is configured. This blocks agent-initiated probing of
+internal services / cloud metadata endpoints.
+
+### WebSocket Authorization
+The Web UI WebSocket endpoint requires a shared token:
+
+```bash
+export PYHARNESS_WS_TOKEN=$(python -c "import secrets;print(secrets.token_hex(16))")
+pyharness serve
+```
+
+Unauthenticated upgrade attempts are rejected. Events are delivered **unicast**
+(per subscribed session) — one client never sees another session's traffic.
+
+### Backpressure
+Outbound event/topic queues are bounded. If a client falls behind, the server
+drops the slowest frames rather than growing unbounded memory.
+
+### Human-in-the-Loop Guard
+High-risk tools (`python_exec`, `shell_exec`, `fs_write`, `fs_delete`) require
+interactive confirmation via the `ask_user_confirmation` hook before execution.
+
+---
+
+## 🧪 Evaluation Framework (`pyharness eval`)
+
+Score your agents the same way you ship them — the eval runner builds its
+harness through the same `build_harness()` factory.
+
+```bash
+# Run the built-in suite with the dummy provider (no network)
+pyharness eval --suite basic --model dummy --no-judge
+
+# Run with a real model + LLM-as-judge
+pyharness eval --suite basic --model nvidia/nemotron-3-ultra-550b-a55b:free \
+               --judge nvidia/nemotron-3-ultra-550b-a55b:free
+```
+
+- Reports are written to `eval_reports/` (JSON + Markdown) and show a diff
+  against the previous run (per-task ↑/↓/= and total-score delta).
+- A task passes only when its **programmatic checks** pass **and** the judge
+  returns valid scores.
+- Eval runs use `auto_approve=True` so batch runs are never blocked by the
+  interactive Guard.
+
+Suite files are plain YAML (`evals/basic.yaml`):
+
+```yaml
+tasks:
+  - id: code_prime
+    category: code_exec
+    prompt: "Return the 100th prime."
+    checks:
+      - type: contains
+        value: "541"
+      - type: tool_called
+        tool: python_exec
+```
+
+---
+
+## 🔌 Hot-Swappable Plugins
+
+Add, update, or remove tools at runtime — no restart required.
+
+```bash
+# List currently loaded plugins
+curl -s http://127.0.0.1:3080/api/plugins
+
+# Load a new tool plugin
+pyharness plugin load ./demo_tool.py
+
+# Edit demo_tool.py (e.g. change return "v1" -> "v2") then hot-reload
+pyharness plugin reload ./demo_tool.py
+
+# Remove it again
+pyharness plugin unload ./demo_tool.py
+```
+
+A minimal hot-loadable tool plugin:
+
+```python
+# demo_tool.py
+from pyharness.plugins.tool_python_exec import ToolResult, ToolResultStatus
+from pyharness.schema import ToolArg, ToolSpec
+from pluggy import HookimplMarker
+
+hookimpl = HookimplMarker("pyharness")
+
+class DemoTool:
+    @hookimpl
+    def get_tool_specs(self, context):
+        return (ToolSpec(
+            name="say_hi",
+            description="Echo a greeting.",
+            parameters=(ToolArg(name="name", type="string", required=True),),
+        ),)
+
+    @hookimpl
+    async def execute_tool(self, context, tool, arguments):
+        if tool.name != "say_hi":
+            return None
+        return ToolResult(tool_name="say_hi",
+                          status=ToolResultStatus.OK,
+                          output={"greeting": f"v1 hi {arguments.get('name')}"})
+```
+
+Re-running `plugin reload` after editing the file picks up the new code
+immediately.
+
+---
+
 ## 🗺️ Roadmap
 
-- [ ] Hot-swappable plugins (load/unload without restart)
-- [ ] Docker-based sandbox for code execution
+- [x] Hot-swappable plugins (load/unload without restart)
+- [x] Docker-based sandbox for code execution
 - [ ] Multimodal support (vision, audio)
 - [ ] Distributed agent clusters (Redis/Ray)
 - [ ] Streaming SSE for MCP tools
-- [ ] Built-in evaluation harness (LLM-as-judge)
+- [x] Built-in evaluation harness (LLM-as-judge)
 
 ---
 

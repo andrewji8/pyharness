@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "pyharness-ai"
-version = "0.7.0"
+version = "0.8.0"
 description = "PyHarness: Everything is a Plugin. A Python Agent Framework."
 readme = "README.md"
 license = {text = "MIT"}
@@ -76,6 +76,7 @@ memory = "pyharness.plugins.session_store"
 subagent = "pyharness.plugins.tool_subagent"
 workflow = "pyharness.plugins.workflow"
 mcp = "pyharness.plugins.mcp_client"
+python-exec = "pyharness.plugins.tool_python_exec"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/pyharness"]
@@ -87,6 +88,9 @@ include = ["src/", "README.md", "LICENSE", "static/", "mcp_servers.json"]
 asyncio_mode = "auto"
 testpaths = ["tests"]
 filterwarnings = ["ignore:.*starlette.testclient.*deprecated.*"]
+markers = [
+    "docker: mark test as requiring Docker",
+]
 
 [tool.ruff]
 line-length = 120

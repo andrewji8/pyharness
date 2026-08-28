@@ -4,12 +4,12 @@ Thin-Core principle
 -------------------
 The engine owns exactly three responsibilities, nothing more:
 
-1. **Event Bus** — a pluggy ``PluginManager`` dispatches every hook call to the
+1. **Event Bus** -- a pluggy ``PluginManager`` dispatches every hook call to the
    registered plugin set. ``@hookspec``/``@hookimpl`` are the mechanism; plugins
    are just Python objects registered into the manager (entry-points auto-load).
-2. **Plugin Loading** — optional discovery from package entry-points (group
+2. **Plugin Loading** -- optional discovery from package entry-points (group
    ``pyharness.plugins``) plus explicit ``register()``.
-3. **Context Management** — the session runner opens a task-scoped
+3. **Context Management** -- the session runner opens a task-scoped
    :class:`SessionContext` and advances it through immutable snapshots.
 
 Everything domain-specific (LLM providers, tool executors, CLIs, Web UI) lives
@@ -19,11 +19,20 @@ in plugins and reaches the harness only through the hooks in :mod:`specs`.
 from __future__ import annotations
 
 import asyncio
+import importlib.util
 import inspect
+import json
 import logging
+import sys
+import time
+import types
+import uuid
 from collections import defaultdict
 from collections.abc import AsyncIterator, Callable
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import Any
+
+logger = logging.getLogger(__name__)
 
 from pluggy import PluginManager
 
@@ -44,11 +53,9 @@ from pyharness.schema import (
     ToolCall,
     ToolResult,
     ToolResultStatus,
+    ToolSpec,
 )
 from pyharness.specs import AgentHooks
-
-if TYPE_CHECKING:
-    from pluggy._hooks import _HookRelay  # only for type hints
 
 
 async def _settle(values: tuple[Any, ...]) -> list[Any]:
@@ -75,6 +82,50 @@ async def _settle(values: tuple[Any, ...]) -> list[Any]:
             logger = logging.getLogger("pyharness.core")
             logger.error("Hook implementation raised an exception: %s", exc, exc_info=True)
     return settled
+
+
+def _safe_hook(label: str, call: Callable[[], Any]) -> None:
+    """Invoke a *synchronous* hook fan-out, isolating plugin failures.
+
+    ``_settle`` already protects async hooks; a raising sync ``@hookimpl``
+    would otherwise propagate straight through and kill the whole session.
+    """
+    try:
+        call()
+    except Exception:
+        logger.error("sync hook %s raised; plugin failure isolated", label, exc_info=True)
+
+
+def _tool_result_to_text(result: "ToolResult") -> str:
+    """把 :class:`ToolResult` 规整为写入对话 transcript 的纯文本。
+
+    ``ToolResult.output`` 是 ``dict[str, Any]``，而 ``Message.content`` 必须是
+    字符串；不同工具把面向 LLM 的正文放在不同键上（``content``/``stdout``/
+    ``text``/``echo``/``result``/``results``）。这里统一提取，丢弃易膨胀的
+    ``code`` 字段，失败时直接返回 ``error`` 文案，避免把 Python dict repr
+    直接塞进模型上下文。
+    """
+    if result.error:
+        return result.error
+    out = result.output
+    if not out:
+        return ""
+    for key in ("content", "stdout", "text", "echo", "result"):
+        value = out.get(key)
+        if isinstance(value, str):
+            return value
+        if isinstance(value, list):
+            return "\n".join(str(v) for v in value)
+    results = out.get("results")
+    if isinstance(results, list):
+        return "\n".join(str(v) for v in results)
+    compact = {k: v for k, v in out.items() if k != "code"}
+    if not compact:
+        return ""
+    try:
+        return json.dumps(compact, ensure_ascii=False)
+    except (TypeError, ValueError):
+        return str(compact)
 
 
 def _tool_specs_to_openai_tools(specs: list[Any]) -> list[dict[str, Any]]:
@@ -109,6 +160,91 @@ def _tool_specs_to_openai_tools(specs: list[Any]) -> list[dict[str, Any]]:
     return tools
 
 
+# --------------------------------------------------------------------------- #
+# Plugin lifecycle errors
+# --------------------------------------------------------------------------- #
+class PluginError(Exception):
+    """Base error raised by plugin load/unload/reload operations."""
+
+
+class PluginNotFoundError(PluginError):
+    """Raised when a referenced plugin is not present in the registry."""
+
+
+class PluginCoreProtectedError(PluginError):
+    """Raised when an operation targets a protected core plugin."""
+
+
+# Class names that are always treated as protected core plugins.
+_CORE_PLUGIN_CLASS_NAMES = frozenset(
+    {
+        "SQLiteSessionStorePlugin",
+        "HTTPProvider",
+        "DummyProvider",
+        "CliObserver",
+    }
+)
+
+
+def _plugin_is_core(plugin: Any, name: str) -> bool:
+    """Best-effort detection of whether a plugin is a protected core plugin.
+
+    Core plugins are infrastructure the harness cannot run without (LLM
+    providers, session store, the CLI observer). They must never be unloaded
+    or reloaded at runtime.
+    """
+    if getattr(plugin, "CORE_PLUGIN", False):
+        return True
+    if isinstance(plugin, types.ModuleType):
+        mod = plugin.__name__
+        if mod.endswith("llm.entry") or "plugins.session_store" in mod:
+            return True
+    else:
+        if type(plugin).__name__ in _CORE_PLUGIN_CLASS_NAMES:
+            return True
+    if name in _CORE_PLUGIN_CLASS_NAMES:
+        return True
+    return False
+
+
+def _resolve_plugin_instance(module: types.ModuleType) -> Any:
+    """Extract the plugin object from an imported module.
+
+    Resolution order:
+
+    1. ``module.PLUGIN`` -- a ready-made instance.
+    2. ``module.create_plugin()`` -- a factory callable.
+    3. The first class *defined in the module* that carries at least one
+       ``@hookimpl`` method; it is instantiated.
+    """
+    plugin = getattr(module, "PLUGIN", None)
+    if plugin is not None:
+        return plugin
+
+    factory = getattr(module, "create_plugin", None)
+    if callable(factory):
+        created = factory()
+        if created is not None:
+            return created
+
+    for _, obj in inspect.getmembers(module, inspect.isclass):
+        if obj.__module__ != module.__name__:
+            continue
+        if _class_has_hookimpl(obj):
+            try:
+                return obj()
+            except Exception:
+                continue
+    return None
+
+
+def _class_has_hookimpl(cls: type) -> bool:
+    for attr in vars(cls).values():
+        if callable(attr) and any(n.endswith("_hookimpl") for n in dir(attr)):
+            return True
+    return False
+
+
 # ---------------------------------------------------------------------------
 # Default system prompt (injected when agent.system_prompt is empty)
 # ---------------------------------------------------------------------------
@@ -122,7 +258,8 @@ _DEFAULT_SYSTEM_PROMPT_TEMPLATE = """\
 2. 当被问"你能联网吗"时，回答："可以，我能通过工具获取实时信息。"
 3. 严禁直接回答"我无法联网"或"我没有联网能力"。
 4. 优先使用工具获取准确信息，而不是依赖训练数据中的过期信息。
-5. 当任务包含 2 个以上步骤时，必须先调用 workflow 工具创建执行计划，再按计划逐步执行。"""
+5. 当任务包含 2 个以上步骤时，必须先调用 workflow 工具创建执行计划，再按计划逐步执行。
+6. 当子 Agent 未返回有效结果时，你必须自己调用工具真实执行，严禁凭记忆编造结果。"""
 
 
 def _build_default_system_prompt(harness: "Harness", ctx: SessionContext, agent: AgentConfig) -> str:
@@ -236,31 +373,249 @@ class Harness:
         self.config = config or HarnessConfig()
         # Terminal snapshot of the most recent stream_session() run.
         self.last_context: SessionContext | None = None
+        # Live registry of every plugin known to the harness. Maps the
+        # pluggy-assigned name to bookkeeping used by hot-reload.
+        self._plugin_registry: dict[str, dict[str, Any]] = {}
+        self._plugin_lock = asyncio.Lock()
         if self.config.auto_load_entry_points:
             self.bus.load_entry_points(self.config.plugin_group)
+        self._record_pm_plugins()
 
     # -- lifecycle ---------------------------------------------------------- #
     def initialize(self) -> None:
         """Signal a newly-wired harness; best-effort sync fan-out to plugins."""
-        self.bus.pm.hook.harness_initialized(harness=self)
+        _safe_hook("harness_initialized", lambda: self.bus.pm.hook.harness_initialized(harness=self))
 
     def shutdown(self) -> None:
         """Graceful teardown; best-effort sync fan-out to plugins."""
-        self.bus.pm.hook.harness_shutdown(harness=self)
+        _safe_hook("harness_shutdown", lambda: self.bus.pm.hook.harness_shutdown(harness=self))
 
     # -- plugin management -------------------------------------------------- #
-    def register_plugin(self, plugin: Any, name: str | None = None) -> str | None:
+    def register_plugin(self, plugin: Any, name: str | None = None, *, core: bool = False) -> str | None:
         """Register a plugin object with the harness.
 
         This is the preferred public API for adding plugins. It delegates to
-        :meth:`EventBus.register` and returns the pluggy-assigned name, or
-        ``None`` if registration failed.
+        :meth:`EventBus.register`, records the plugin in the live registry, and
+        returns the pluggy-assigned name (or ``None`` if registration failed).
+
+        Args:
+            plugin: The plugin module or instance to register.
+            name: Optional explicit registry name. When omitted, a name is
+                derived from the plugin (its class name, or ``module.__name__``).
+            core: Force ``core=True``. Core plugins are protected from
+                unload/reload at runtime.
         """
-        return self.bus.register(plugin, name=name)
+        assigned = self.bus.register(plugin, name=name)
+        if assigned is not None:
+            self._plugin_registry[assigned] = {
+                "instance": plugin,
+                "source_path": getattr(plugin, "__file__", None),
+                "core": bool(core) or _plugin_is_core(plugin, assigned),
+                "module_name": getattr(plugin, "__name__", None)
+                if isinstance(plugin, types.ModuleType)
+                else None,
+            }
+        return assigned
 
     def unregister_plugin(self, plugin: Any | None = None, name: str | None = None) -> Any | None:
-        """Remove a previously registered plugin."""
-        return self.bus.unregister(plugin=plugin, name=name)
+        """Remove a previously registered plugin and drop it from the registry."""
+        removed = self.bus.unregister(plugin=plugin, name=name)
+        if name is not None and name in self._plugin_registry:
+            self._plugin_registry.pop(name, None)
+        return removed
+
+    def _record_pm_plugins(self) -> None:
+        """Mirror every pluggy-registered plugin into ``self._plugin_registry``.
+
+        Idempotent: plugins already present (e.g. registered via
+        :meth:`register_plugin`) keep their existing record.
+        """
+        for pname, plugin in self.bus.pm.list_name_plugin():
+            if pname in self._plugin_registry:
+                continue
+            self._plugin_registry[pname] = {
+                "instance": plugin,
+                "source_path": getattr(plugin, "__file__", None),
+                "core": _plugin_is_core(plugin, pname),
+                "module_name": getattr(plugin, "__name__", None)
+                if isinstance(plugin, types.ModuleType)
+                else None,
+            }
+
+    async def list_plugins(self) -> list[dict[str, Any]]:
+        """Return metadata for every registered plugin.
+
+        Safe to call at any time; reads behind the plugin lock.
+        """
+        async with self._plugin_lock:
+            return [
+                {
+                    "name": name,
+                    "core": rec["core"],
+                    "source_path": rec.get("source_path"),
+                }
+                for name, rec in self._plugin_registry.items()
+            ]
+
+    async def load_plugin(self, source: str) -> dict[str, Any]:
+        """Load a plugin from a ``.py`` file at runtime.
+
+        The module is imported via :mod:`importlib`, the plugin object is
+        resolved (``PLUGIN`` / ``create_plugin()`` / first ``@hookimpl`` class),
+        registered, and a ``plugin_loaded`` hook is broadcast. On any failure the
+        partial import is rolled back (module dropped from ``sys.modules``,
+        nothing registered) and a :class:`PluginError` is raised.
+
+        Args:
+            source: Path to the ``.py`` file exposing the plugin.
+
+        Returns:
+            ``{"ok": True, "name": <registry name>, "core": <bool>}``.
+
+        Raises:
+            PluginError: If the file is missing, cannot be imported, or contains
+                no resolvable plugin object.
+        """
+        async with self._plugin_lock:
+            return await self._do_load(source)
+
+    async def unload_plugin(self, name: str) -> dict[str, Any]:
+        """Unload a previously loaded plugin by registry name.
+
+        Refuses to unload core plugins. Broadcasts ``plugin_unloaded`` before
+        removing the plugin so it can release resources.
+
+        Raises:
+            PluginNotFoundError: If ``name`` is not registered.
+            PluginCoreProtectedError: If ``name`` is a protected core plugin.
+        """
+        async with self._plugin_lock:
+            return await self._do_unload(name)
+
+    async def reload_plugin(self, name: str) -> dict[str, Any]:
+        """Reload a file-backed plugin by registry name.
+
+        Equivalent to ``unload`` + clearing the module cache + ``load``. Core
+        plugins and plugins not backed by a file are refused.
+
+        Returns:
+            The result of the subsequent :meth:`load_plugin` call.
+
+        Raises:
+            PluginNotFoundError / PluginCoreProtectedError / PluginError.
+        """
+        async with self._plugin_lock:
+            rec = self._plugin_registry.get(name)
+            if rec is None:
+                raise PluginNotFoundError(f"Plugin '{name}' not found")
+            if rec["core"]:
+                raise PluginCoreProtectedError(
+                    f"Plugin '{name}' is a core plugin and cannot be reloaded"
+                )
+            source = rec.get("source_path")
+            if not source:
+                raise PluginError(
+                    f"Plugin '{name}' was not loaded from a file; cannot reload"
+                )
+            await self._do_unload(name)
+            module_name = rec.get("module_name")
+            if module_name and module_name in sys.modules:
+                sys.modules.pop(module_name, None)
+            return await self._do_load(source)
+
+    async def _do_load(self, source: str) -> dict[str, Any]:
+        """Implementation of :meth:`load_plugin` (lock already held)."""
+        path = Path(source)
+        if not path.is_file():
+            raise PluginError(f"Plugin file not found: {source}")
+
+        module_name = f"pyharness_dynamic.{uuid.uuid4().hex}"
+        spec = importlib.util.spec_from_file_location(module_name, path)
+        if spec is None or spec.loader is None:
+            raise PluginError(f"Cannot import plugin module from {source}")
+
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = module
+        try:
+            spec.loader.exec_module(module)
+        except Exception as exc:  # noqa: BLE001 - roll back and report
+            sys.modules.pop(module_name, None)
+            raise PluginError(f"Plugin import failed: {exc}") from exc
+
+        instance = _resolve_plugin_instance(module)
+        if instance is None:
+            sys.modules.pop(module_name, None)
+            raise PluginError(
+                f"No plugin object in {source} "
+                "(expected PLUGIN / create_plugin() / a class with @hookimpl)"
+            )
+
+        plugin_name = (
+            getattr(module, "PLUGIN_NAME", None)
+            or getattr(instance, "name", None)
+            or path.stem
+        )
+        if plugin_name in self._plugin_registry:
+            sys.modules.pop(module_name, None)
+            raise PluginError(f"Plugin '{plugin_name}' is already loaded")
+
+        try:
+            self.bus.register(instance, name=plugin_name)
+        except Exception as exc:  # noqa: BLE001 - roll back and report
+            sys.modules.pop(module_name, None)
+            raise PluginError(f"Plugin register failed: {exc}") from exc
+
+        self._plugin_registry[plugin_name] = {
+            "instance": instance,
+            "source_path": str(path),
+            "core": _plugin_is_core(instance, plugin_name),
+            "module_name": module_name,
+        }
+
+        # Let the freshly loaded plugin capture the harness, and broadcast.
+        try:
+            _safe_hook(
+                "harness_initialized",
+                lambda: self.bus.pm.hook.harness_initialized(harness=self),
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("plugin harness_initialized failed")
+        try:
+            await _settle(
+                self.bus.pm.hook.plugin_loaded(harness=self, name=plugin_name)
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("plugin_loaded hook failed")
+
+        return {
+            "ok": True,
+            "name": plugin_name,
+            "core": self._plugin_registry[plugin_name]["core"],
+        }
+
+    async def _do_unload(self, name: str) -> dict[str, Any]:
+        """Implementation of :meth:`unload_plugin` (lock already held)."""
+        rec = self._plugin_registry.get(name)
+        if rec is None:
+            raise PluginNotFoundError(f"Plugin '{name}' not found")
+        if rec["core"]:
+            raise PluginCoreProtectedError(
+                f"Plugin '{name}' is a core plugin and cannot be unloaded"
+            )
+
+        try:
+            await _settle(
+                self.bus.pm.hook.plugin_unloaded(harness=self, name=name)
+            )
+        except Exception:  # noqa: BLE001
+            logger.exception("plugin_unloaded hook failed")
+        try:
+            self.bus.unregister(name=name)
+        except Exception:  # noqa: BLE001
+            logger.exception("plugin unregister failed")
+
+        self._plugin_registry.pop(name, None)
+        return {"ok": True, "name": name}
 
     # -- session runner ----------------------------------------------------- #
     async def run_session(
@@ -282,20 +637,40 @@ class Harness:
         Data flow (all reversibility-preserving snapshot transitions)::
 
             [optional] load_session(resume_session_id)
-            open_session → session_started
-                         → (optional) user message appended + observed
-                         → loop: agent_next
-                                 └─ execute_tool per tool_call (observed)
-                                 └─ assistant message appended
-                                 └─ [optional] save_session(after each turn)
-                         → check_shutdown / exit
-                         → session_finished
-                         → save_session(final)
+            open_session -> session_started
+                         -> (optional) user message appended + observed
+                         -> loop: agent_next
+                                 |- execute_tool per tool_call (observed)
+                                 |- assistant message appended
+                                 |- [optional] save_session(after each turn)
+                         -> check_shutdown / exit
+                         -> session_finished
+                         -> save_session(final)
 
         Returns the final :class:`SessionContext` snapshot (the terminal state).
         """
-        # 1. Try to resume from persistent store before opening a new session.
-        resume_ctx: SessionContext | None = continue_from
+        resume_ctx = await self._resolve_resume_ctx(continue_from, resume_session_id)
+        async with open_session(namespace=self.config.namespace, context=resume_ctx) as ctx:
+            effective_agent, ctx = await self._begin_session(ctx, agent, initial_text)
+
+            out: list[SessionContext] = []
+            async for _ in self._run_agent_loop(ctx, effective_agent, stream=False, out=out):
+                pass
+            ctx = out[0]
+
+            _safe_hook("session_finished", lambda: self.bus.pm.hook.session_finished(context=ctx))
+            self.last_context = ctx
+            # Persist the final snapshot after the session ends.
+            await self._save_session(ctx)
+            return ctx
+
+    async def _resolve_resume_ctx(
+        self,
+        continue_from: SessionContext | None,
+        resume_session_id: str | None,
+    ) -> SessionContext | None:
+        """Restore a persisted session (by id) or adopt ``continue_from``."""
+        resume_ctx = continue_from
         if resume_ctx is None and resume_session_id is not None:
             for value in await _settle(
                 self.bus.pm.hook.load_session(session_id=resume_session_id)
@@ -304,7 +679,7 @@ class Harness:
                     data = SessionData.model_validate(value)
                     resume_ctx = SessionContext(
                         session_id=data.session_id,
-                        branch_id=__import__("uuid").uuid4(),
+                        branch_id=uuid.uuid4(),
                         parent_id=None,
                         namespace=data.namespace,
                         messages=data.messages,
@@ -313,56 +688,33 @@ class Harness:
                         created_at=data.created_at,
                     )
                     break
+        return resume_ctx
 
-        async with open_session(namespace=self.config.namespace, context=resume_ctx) as ctx:
-            # Inject default system prompt when none is provided.
-            effective_agent = agent
-            if not agent.system_prompt:
-                default_prompt = _build_default_system_prompt(self, ctx, agent)
-                if default_prompt:
-                    effective_agent = agent.model_copy(update={"system_prompt": default_prompt})
+    async def _begin_session(
+        self,
+        ctx: SessionContext,
+        agent: AgentConfig,
+        initial_text: str | None,
+    ) -> tuple[AgentConfig, SessionContext]:
+        """Inject a default system prompt (if needed), fire ``session_started``
+        and append the initial user message. Returns ``(effective_agent, ctx)``.
+        """
+        effective_agent = agent
+        if not agent.system_prompt:
+            default_prompt = _build_default_system_prompt(self, ctx, agent)
+            if default_prompt:
+                effective_agent = agent.model_copy(update={"system_prompt": default_prompt})
 
-            self.bus.pm.hook.session_started(context=ctx, agent=effective_agent)
+        _safe_hook("session_started", lambda: self.bus.pm.hook.session_started(context=ctx, agent=effective_agent))
 
-            if initial_text is not None:
-                ctx = ctx.append_message(Message(role=Role.USER, content=initial_text))
-                await self.bus.aemit(
-                    EventType.USER_MESSAGE.value,
-                    context=ctx,
-                    text=initial_text,
-                )
-
-            steps = 0
-            while steps < effective_agent.max_steps:
-                resp = await self._agent_next(ctx, effective_agent)
-                if resp is None:
-                    break
-
-                ctx = await self._apply_tools(ctx, resp)
-                if resp.content:
-                    ctx = ctx.append_message(
-                        Message(role=Role.ASSISTANT, content=resp.content)
-                    )
-
-                if not resp.tool_calls:
-                    await self.bus.aemit(
-                        EventType.ASSISTANT_FINISHED.value,
-                        context=ctx,
-                        text=resp.content,
-                    )
-                    break
-
-                if await self._should_stop(ctx, effective_agent):
-                    break
-                steps += 1
-
-            self.bus.pm.hook.session_finished(context=ctx)
-            self.last_context = ctx
-
-            # 2. Persist the final snapshot after the session ends.
-            await self._save_session(ctx)
-
-            return ctx
+        if initial_text is not None:
+            ctx = ctx.append_message(Message(role=Role.USER, content=initial_text))
+            await self.bus.aemit(
+                EventType.USER_MESSAGE.value,
+                context=ctx,
+                text=initial_text,
+            )
+        return effective_agent, ctx
 
     async def _save_session(self, ctx: SessionContext) -> None:
         """Best-effort persistence: fan out to all ``save_session`` impls."""
@@ -394,71 +746,25 @@ class Harness:
         The terminal :class:`SessionContext` snapshot is stored at
         ``self.last_context`` after the loop ends.
         """
-        resume_ctx: SessionContext | None = continue_from
-        if resume_ctx is None and resume_session_id is not None:
-            for value in await _settle(
-                self.bus.pm.hook.load_session(session_id=resume_session_id)
-            ):
-                if value is not None:
-                    data = SessionData.model_validate(value)
-                    resume_ctx = SessionContext(
-                        session_id=data.session_id,
-                        branch_id=__import__("uuid").uuid4(),
-                        parent_id=None,
-                        namespace=data.namespace,
-                        messages=data.messages,
-                        memory=data.memory,
-                        metadata={},
-                        created_at=data.created_at,
-                    )
-                    break
-
+        resume_ctx = await self._resolve_resume_ctx(continue_from, resume_session_id)
         async with open_session(namespace=namespace or self.config.namespace, context=resume_ctx) as ctx:
-            # Inject default system prompt when none is provided.
-            effective_agent = agent
-            if not agent.system_prompt:
-                default_prompt = _build_default_system_prompt(self, ctx, agent)
-                if default_prompt:
-                    effective_agent = agent.model_copy(update={"system_prompt": default_prompt})
+            effective_agent, ctx = await self._begin_session(ctx, agent, initial_text)
 
-            self.bus.pm.hook.session_started(context=ctx, agent=effective_agent)
+            out: list[SessionContext] = []
+            async for chunk in self._run_agent_loop(ctx, effective_agent, stream=True, out=out):
+                yield chunk
+            ctx = out[0]
 
-            if initial_text is not None:
-                ctx = ctx.append_message(Message(role=Role.USER, content=initial_text))
-                await self.bus.aemit(
-                    EventType.USER_MESSAGE.value, context=ctx, text=initial_text
-                )
-
-            steps = 0
-            while steps < effective_agent.max_steps:
-                request = await self.build_request(ctx, effective_agent)
-                resp, chunks = await self._stream_turn(ctx, request)
-                for chunk in chunks:
-                    yield chunk
-
-                if resp is None:
-                    break
-                ctx = await self._apply_tools(ctx, resp)
-                if resp.content:
-                    ctx = ctx.append_message(
-                        Message(role=Role.ASSISTANT, content=resp.content)
-                    )
-                if not resp.content and not resp.tool_calls:
-                    break
-                if not resp.tool_calls:
-                    await self.bus.aemit(
-                        EventType.ASSISTANT_FINISHED.value, context=ctx, text=resp.content
-                    )
-                    break
-                if await self._should_stop(ctx, effective_agent):
-                    break
-                steps += 1
-
-            self.bus.pm.hook.session_finished(context=ctx)
+            _safe_hook("session_finished", lambda: self.bus.pm.hook.session_finished(context=ctx))
             self.last_context = ctx
             await self._save_session(ctx)
 
-    async def build_request(self, ctx: SessionContext, agent: AgentConfig) -> LLMRequest:
+    async def build_request(
+        self,
+        ctx: SessionContext,
+        agent: AgentConfig,
+        tools_override: list[Any] | None = None,
+    ) -> LLMRequest:
         """Assemble a schema-driven :class:`LLMRequest` from the transcript.
 
         Pre-pends the agent's system prompt (when set) and freezes the current
@@ -473,14 +779,22 @@ class Harness:
             if agent.system_prompt
             else []
         )
+        if tools_override is not None:
+            tool_specs = tools_override
+        else:
+            tool_specs = [
+                s
+                for specs in self.bus.pm.hook.get_tool_specs(context=ctx)
+                if specs
+                for s in specs
+            ]
         request = LLMRequest(
             model=agent.model,
             messages=tuple((*system, *ctx.messages)),
             temperature=agent.temperature,
-            tools=_tool_specs_to_openai_tools([
-                s for specs in self.bus.pm.hook.get_tool_specs(context=ctx) if specs for s in specs
-            ]),
+            tools=_tool_specs_to_openai_tools(tool_specs),
         )
+        logger.info("[subagent] %s llm_request tools=%s", agent.name, [t.get("function", {}).get("name") for t in request.tools])
         # Allow plugins to intercept and transform the message list.
         modified = await _settle(
             self.bus.pm.hook.build_request(messages=list(request.messages))
@@ -492,7 +806,97 @@ class Harness:
         return request
 
     # -- internals ---------------------------------------------------------- #
-    async def _agent_next(self, ctx: SessionContext, agent: AgentConfig) -> LLMResponse | None:
+    async def _run_agent_loop(
+        self,
+        ctx: SessionContext,
+        agent: AgentConfig,
+        *,
+        stream: bool = False,
+        tools_override: list[Any] | None = None,
+        allowed_tools: list[str] | None = None,
+        out: list[SessionContext] | None = None,
+    ) -> AsyncIterator[LLMStreamChunk]:
+        """Single source of truth for the agent loop (DRY).
+
+        Shared by :meth:`run_session`, :meth:`stream_session` and the subagent
+        fallback. It builds the next :class:`LLMResponse`, appends the assistant
+        message (carrying ``tool_calls``) *before* the tool results, executes the
+        tools, and advances the state machine. ``stream=True`` additionally
+        yields :class:`LLMStreamChunk` deltas; ``stream=False`` runs silently.
+
+        The terminal :class:`SessionContext` is appended to ``out`` (a
+        caller-supplied list) so both generators and coroutines can retrieve it.
+        """
+        depth = _subagent_depth.get(None) or 0
+        steps = 0
+        while steps < agent.max_steps:
+            if stream:
+                request = await self.build_request(ctx, agent, tools_override=tools_override)
+                resp, chunks = await self._stream_turn(ctx, request)
+                for chunk in chunks:
+                    yield chunk
+            else:
+                resp = await self._agent_next(ctx, agent, tools_override=tools_override)
+
+            if resp is None:
+                break
+
+            tool_specs = self._select_tool_specs(ctx, depth, tools_override, allowed_tools)
+
+            # assistant(tool_calls) 必须在 tool 结果之前，否则 OpenAI 兼容接口
+            # 会因 tool_call_id 无法关联而报错。
+            if resp.tool_calls:
+                ctx = ctx.append_message(
+                    Message(role=Role.ASSISTANT, content=resp.content, tool_calls=resp.tool_calls)
+                )
+                ctx = await self._apply_tools(ctx, resp, tool_specs=tool_specs)
+            elif resp.content:
+                ctx = ctx.append_message(Message(role=Role.ASSISTANT, content=resp.content))
+
+            if not resp.tool_calls:
+                await self.bus.aemit(
+                    EventType.ASSISTANT_FINISHED.value, context=ctx, text=resp.content
+                )
+                break
+            if await self._should_stop(ctx, agent):
+                break
+            steps += 1
+
+        if out is not None:
+            out.append(ctx)
+
+    def _select_tool_specs(
+        self,
+        ctx: SessionContext,
+        depth: int,
+        tools_override: list[Any] | None,
+        allowed_tools: list[str] | None,
+    ) -> dict[str, Any] | None:
+        """Resolve the tool-spec map handed to ``_apply_tools``.
+
+        Top-level sessions (no override, no whitelist) return ``None`` so
+        ``_apply_tools`` fetches every registered spec. Subagent sessions pass a
+        ``tools_override`` (inherited parent tools) and an optional
+        ``allowed_tools`` whitelist; here we filter by whitelist and strip
+        recursion-prone spawn tools at the current depth.
+        """
+        if tools_override is None and allowed_tools is None:
+            return None
+        if tools_override is not None:
+            base = {t.name: t for t in tools_override}
+        else:
+            base = {}
+            for plugin_specs in self.bus.pm.hook.get_tool_specs(context=ctx):
+                base.update({s.name: s for s in plugin_specs})
+        filtered = self._filter_tools(list(base.values()), allowed=allowed_tools, depth=depth)
+        return {t.name: t for t in filtered}
+
+    async def _agent_next(
+        self,
+        ctx: SessionContext,
+        agent: AgentConfig,
+        tools_override: list[Any] | None = None,
+    ) -> LLMResponse | None:
         """Decide the next assistant response.
 
         Tries the ``agent_next`` plugin hooks first (an optional policy
@@ -504,7 +908,7 @@ class Harness:
         ):
             if value is not None:
                 return LLMResponse.model_validate(value)
-        request = await self.build_request(ctx, agent)
+        request = await self.build_request(ctx, agent, tools_override=tools_override)
         return await self._complete(ctx, request)
 
     async def _complete(
@@ -562,7 +966,7 @@ class Harness:
         if not resp.tool_calls:
             return ctx
         # get_tool_specs is a fan-in hook: each plugin contributes a tuple, so
-        # flatten across all impls into a name→spec map.
+        # flatten across all impls into a name->spec map.
         specs: dict[str, Any] = tool_specs if tool_specs is not None else {}
         if not specs:
             for plugin_specs in self.bus.pm.hook.get_tool_specs(context=ctx):
@@ -597,6 +1001,7 @@ class Harness:
                     arguments=call.arguments,
                 )
                 result = await self._exec_tool(ctx, spec, call.arguments)
+                logger.info("[subagent] tool_call=%s tool_result_status=%s", call.tool_name, result.status)
                 await self.bus.aemit(
                     EventType.TOOL_RESULT.value,
                     context=ctx,
@@ -604,7 +1009,7 @@ class Harness:
                     result=result,
                 )
             ctx = ctx.append_message(
-                Message(role=Role.TOOL, name=call.tool_name, content=str(result.output), tool_call_id=call.id)
+                Message(role=Role.TOOL, name=call.tool_name, content=_tool_result_to_text(result), tool_call_id=call.id)
             )
         return ctx
 
@@ -698,15 +1103,20 @@ class Harness:
         depth: int,
     ) -> SubagentResult:
         """Internal fallback: run a sub-session with timeout and depth tracking."""
-        import uuid
-
-        start = __import__("time").time()
+        start = time.time()
         child_session_id = uuid.uuid4()
 
+        model = spec.model if spec.model != "default" else parent_config.model
+        system_prompt = spec.system_prompt or (
+            "你是一个子 Agent，正在执行上级指派的具体任务。"
+            "你必须调用 python_exec 工具真实运行代码并基于输出回答，"
+            "严禁心算或只写代码不运行。"
+            "如需联网搜索，调用 web_search；如需读取文件，调用 fs_read。"
+        )
         child_agent = AgentConfig(
             name=spec.name,
-            model=spec.model,
-            system_prompt=spec.system_prompt or "",
+            model=model,
+            system_prompt=system_prompt,
             max_steps=spec.max_turns,
         )
 
@@ -717,13 +1127,27 @@ class Harness:
             if parent is not None and parent.namespace.startswith("workflow-step:"):
                 ns = parent.namespace
             async with open_session(namespace=ns) as ctx:
+                await _settle(
+                    self.bus.aemit(
+                        "subagent_start",
+                        context=ctx,
+                        name=spec.name,
+                        task=spec.task,
+                    )
+                )
                 if spec.task:
                     ctx = ctx.append_message(Message(role=Role.USER, content=spec.task))
+                logger.info("[subagent] %s entering loop allowed=%s parent_tools=%s", spec.name, spec.allowed_tools, [t.name for t in parent_tools])
                 final = await asyncio.wait_for(
-                    self._execute_agent_loop(ctx, child_agent, allowed_tools=spec.allowed_tools),
+                    self._execute_agent_loop(
+                        ctx,
+                        child_agent,
+                        allowed_tools=spec.allowed_tools,
+                        parent_tools=parent_tools,
+                    ),
                     timeout=spec.timeout,
                 )
-                duration = __import__("time").time() - start
+                duration = time.time() - start
                 last = final.last_message.content if final.last_message else None
                 result = SubagentResult(
                     spec=spec,
@@ -733,9 +1157,18 @@ class Harness:
                     session_id=str(child_session_id),
                 )
                 await _settle(self.bus.pm.hook.subagent_finished(result=result))
+                await _settle(
+                    self.bus.aemit(
+                        "subagent_complete",
+                        context=ctx,
+                        name=spec.name,
+                        status="ok",
+                        summary=last or "",
+                    )
+                )
                 return result
         except TimeoutError:
-            duration = __import__("time").time() - start
+            duration = time.time() - start
             result = SubagentResult(
                 spec=spec,
                 status="timeout",
@@ -744,9 +1177,18 @@ class Harness:
                 session_id=str(child_session_id),
             )
             await _settle(self.bus.pm.hook.subagent_finished(result=result))
+            await _settle(
+                self.bus.aemit(
+                    "subagent_complete",
+                    context=ctx,
+                    name=spec.name,
+                    status="timeout",
+                    summary=result.error or "",
+                )
+            )
             return result
         except Exception as exc:
-            duration = __import__("time").time() - start
+            duration = time.time() - start
             result = SubagentResult(
                 spec=spec,
                 status="error",
@@ -755,6 +1197,15 @@ class Harness:
                 session_id=str(child_session_id),
             )
             await _settle(self.bus.pm.hook.subagent_finished(result=result))
+            await _settle(
+                self.bus.aemit(
+                    "subagent_complete",
+                    context=ctx,
+                    name=spec.name,
+                    status="error",
+                    summary=result.error or "",
+                )
+            )
             return result
         finally:
             _subagent_depth.reset(token)
@@ -768,11 +1219,11 @@ class Harness:
     ) -> list[ToolSpec]:
         """Filter ``tools`` by an optional whitelist and enforce recursion guard.
 
-        If ``allowed`` is ``None``, all tools are kept. When ``depth`` reaches
+        If ``allowed`` is ``None`` or empty, all tools are kept. When ``depth`` reaches
         ``max_depth``, subagent-spawning tools are removed to prevent runaway
         nesting.
         """
-        if allowed is not None:
+        if allowed:
             allowed_set = set(allowed)
             filtered = [t for t in tools if t.name in allowed_set]
         else:
@@ -790,49 +1241,23 @@ class Harness:
         ctx: SessionContext,
         agent: AgentConfig,
         allowed_tools: list[str] | None = None,
+        parent_tools: list[Any] | None = None,
     ) -> SessionContext:
-        """Execute a stripped-down agent loop for subagents.
+        """Subagent loop: thin wrapper over :meth:`_run_agent_loop` (non-stream).
 
-        This reuses the core loop logic but is simplified for the subagent
-        context (no resume, no save hooks).
-
-        **保留 vs 省略的行为：**
-        - ✅ Guard 审批：通过 ``_apply_tools`` 中的 ``_pre_tool_execute`` 保留，
-          子 Agent 执行高危工具同样需要人工确认。
-        - ✅ 事件观测：通过 ``_agent_next`` / ``_apply_tools`` 中的
-          ``observe_event`` 保留，UI 可展示子 Agent 进度。
-        - ❌ Context Compaction：子 Agent 的 ``max_turns`` 通常很小（默认 5），
-          不太可能触发 Token 爆炸，故省略 ``build_request`` 钩子调用。
-        - ❌ spawn_subagents 工具：由 ``depth`` 控制递归，不在子 Agent 中
-          注册并行派生工具，防止无限嵌套。
+        Preserves the subagent-specific tool filtering (whitelist + recursion
+        guard via ``_filter_tools``) and returns the terminal ``SessionContext``
+        so :meth:`_run_subagent` can read the final message.
         """
-        depth = _subagent_depth.get(None) or 0
-        depth = _subagent_depth.get(None) or 0
-        steps = 0
-        while steps < agent.max_steps:
-            resp = await self._agent_next(ctx, agent)
-            if resp is None:
-                break
-
-            # 递归防护：根据当前深度过滤可用工具
-            all_tools: dict[str, Any] = {}
-            for plugin_specs in self.bus.pm.hook.get_tool_specs(context=ctx):
-                all_tools.update({s.name: s for s in plugin_specs})
-            filtered_tools = self._filter_tools(
-                list(all_tools.values()),
-                allowed=allowed_tools,
-                depth=depth,
-            )
-            tool_map = {t.name: t for t in filtered_tools}
-
-            ctx = await self._apply_tools(ctx, resp, tool_specs=tool_map)
-            if resp.content:
-                ctx = ctx.append_message(
-                    Message(role=Role.ASSISTANT, content=resp.content)
-                )
-            if not resp.tool_calls:
-                break
-            if await self._should_stop(ctx, agent):
-                break
-            steps += 1
-        return ctx
+        logger.info("[subagent] %s tools=%s", agent.name, [t.name for t in (parent_tools or [])])
+        out: list[SessionContext] = []
+        async for _ in self._run_agent_loop(
+            ctx,
+            agent,
+            stream=False,
+            tools_override=parent_tools,
+            allowed_tools=allowed_tools,
+            out=out,
+        ):
+            pass
+        return out[0]

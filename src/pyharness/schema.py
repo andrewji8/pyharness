@@ -168,7 +168,7 @@ class SubagentSpec(Frozen):
     system_prompt: str | None = Field(default=None, description="子 Agent 的系统提示词（可选）")
     allowed_tools: list[str] | None = Field(default=None, description="允许使用的工具白名单（None 表示继承全部）")
     max_turns: int = Field(default=5, ge=1, le=20, description="子 Agent 最大循环轮次")
-    timeout: float = Field(default=120.0, ge=10, description="执行超时（秒）")
+    timeout: float = Field(default=240.0, ge=10, description="执行超时（秒）")
 
 
 class SubagentResult(Frozen):
@@ -262,6 +262,9 @@ class SessionData(Frozen):
     messages: tuple[Message, ...] = Field(default_factory=tuple)
     memory: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=_utcnow)
+    # Precomputed by lightweight list endpoints (COUNT query) so listings never
+    # need to load full message bodies. 0 when unknown / not computed.
+    message_count: int = 0
 
 
 class MemorySearchResult(Frozen):

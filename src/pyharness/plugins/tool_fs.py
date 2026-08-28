@@ -56,9 +56,13 @@ class FileSystemPlugin:
         self,
         workspace_dir: str = _DEFAULT_WORKSPACE,
         max_file_size: int = MAX_FILE_SIZE,
+        max_write_bytes: int = 5 * 1024 * 1024,
     ) -> None:
         self.workspace_dir = os.path.abspath(workspace_dir)
         self.max_file_size = max_file_size
+        # Cap for a single fs_write payload (0 disables). Prevents an agent
+        # from filling the disk with one call.
+        self.max_write_bytes = max_write_bytes
         os.makedirs(self.workspace_dir, exist_ok=True)
 
     # ------------------------------------------------------------------ #
@@ -77,16 +81,22 @@ class FileSystemPlugin:
         if os.path.isabs(user_path):
             raise PermissionError("不允许使用绝对路径")
 
-        real_workspace = os.path.realpath(self.workspace_dir)
-        joined = os.path.join(real_workspace, user_path)
+        real_workspace_raw = os.path.realpath(self.workspace_dir)
+        joined = os.path.join(real_workspace_raw, user_path)
         real_path = os.path.realpath(joined)
 
+        # Windows 文件系统大小写不敏感，realpath 返回的大小写可能与
+        # workspace 不同；比较前必须归一化，否则边界判断可能失真。
+        real_workspace = os.path.normcase(real_workspace_raw)
+        real_path_norm = os.path.normcase(real_path)
+
         # 确保解析后的路径在 workspace 内
-        if real_path != real_workspace and not real_path.startswith(real_workspace + os.sep):
+        if real_path_norm != real_workspace and not real_path_norm.startswith(real_workspace + os.sep):
             raise PermissionError(
                 f"路径穿越攻击被拦截: '{user_path}' 解析为 '{real_path}'，"
-                f"超出工作区 '{real_workspace}'"
+                f"超出工作区 '{real_workspace_raw}'"
             )
+        # 返回未 normcase 的真实路径（保持原始大小写，供展示/打开使用）。
         return real_path
 
     # ------------------------------------------------------------------ #
@@ -197,9 +207,21 @@ class FileSystemPlugin:
         content = str(arguments.get("content", ""))
         try:
             real_path = self._resolve(path)
+            payload = content.encode("utf-8")
+            if self.max_write_bytes and len(payload) > self.max_write_bytes:
+                return ToolResult(
+                    tool_name="fs_write",
+                    status=ToolResultStatus.ERROR,
+                    error=f"写入内容过大（{len(payload)} 字节 > 上限 {self.max_write_bytes}）。",
+                    output={"path": path, "bytes": len(payload)},
+                )
             os.makedirs(os.path.dirname(real_path), exist_ok=True)
-            with open(real_path, "w", encoding="utf-8") as f:
+            # Atomic write: write to a temp file then replace, so a failure
+            # mid-write never leaves a truncated/corrupted target file.
+            tmp_path = f"{real_path}.tmp"
+            with open(tmp_path, "w", encoding="utf-8") as f:
                 f.write(content)
+            os.replace(tmp_path, real_path)
             return ToolResult(tool_name="fs_write", status=ToolResultStatus.OK, output={"path": path, "bytes_written": len(content)})
         except PermissionError as exc:
             logger.warning("fs_write blocked: %s", exc)

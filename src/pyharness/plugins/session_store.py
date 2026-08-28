@@ -125,6 +125,10 @@ class SQLiteSessionStorePlugin:
         if self._db is None:
             self._db = await aiosqlite.connect(self.db_path)
             self._db.row_factory = aiosqlite.Row
+            # Concurrency hardening: WAL allows concurrent readers with one
+            # writer; busy_timeout avoids immediate "database is locked".
+            await self._db.execute("PRAGMA journal_mode=WAL")
+            await self._db.execute("PRAGMA busy_timeout=5000")
             await self._db.executescript(_CREATE_SESSIONS)
             await self._db.executescript(_CREATE_MESSAGES)
             await self._db.executescript(_CREATE_FTS)
@@ -186,7 +190,13 @@ class SQLiteSessionStorePlugin:
 
     @hookimpl
     async def list_sessions(self, namespace: str = "default", limit: int = 50, offset: int = 0) -> list[SessionData]:
-        """List persisted sessions ordered by most recent update."""
+        """List persisted sessions ordered by most recent update.
+
+        Lightweight: a single ``LEFT JOIN COUNT`` query fills ``message_count``
+        and message bodies stay empty (``messages=()``) — no N+1 message loads
+        and no conversation content leaks into list responses. Use
+        :meth:`load_session` for full transcripts.
+        """
         if self._db is None:
             await self.initialize()
         if self._db is None:
@@ -194,25 +204,26 @@ class SQLiteSessionStorePlugin:
 
         try:
             rows: list[SessionData] = []
-            async with self._db.execute(
-                """\
-                SELECT id, created_at, updated_at, namespace, metadata
-                FROM sessions
-                WHERE namespace = ?
-                ORDER BY updated_at DESC
+            sql = """\
+                SELECT s.id          AS id,
+                       s.created_at  AS created_at,
+                       s.namespace   AS namespace,
+                       COUNT(m.id)   AS message_count
+                FROM sessions s
+                LEFT JOIN messages m ON m.session_id = s.id
+                WHERE s.namespace = ?
+                GROUP BY s.id, s.created_at, s.namespace
+                ORDER BY s.updated_at DESC
                 LIMIT ? OFFSET ?
-                """,
-                (namespace, limit, offset),
-            ) as cursor:
+                """
+            async with self._db.execute(sql, (namespace, limit, offset)) as cursor:
                 async for row in cursor:
-                    sid = row["id"]
-                    messages = await self._load_messages(sid)
                     rows.append(
                         SessionData(
-                            session_id=uuid.UUID(sid),
+                            session_id=uuid.UUID(row["id"]),
                             namespace=row["namespace"],
-                            messages=tuple(messages),
-                            memory=json.loads(row["metadata"] or "{}"),
+                            messages=(),
+                            message_count=int(row["message_count"]),
                             created_at=datetime.fromtimestamp(
                                 row["created_at"], tz=timezone.utc
                             ),
@@ -496,6 +507,87 @@ class SQLiteSessionStorePlugin:
             ],
         }
         return ToolResult(tool_name="memory_search", status=ToolResultStatus.OK, output=output)
+
+    @hookimpl
+    async def delete_session(self, session_id: str) -> bool:
+        """Delete a persisted session and all its messages from the store."""
+        if self._db is None:
+            await self.initialize()
+        if self._db is None:
+            return False
+
+        try:
+            async with self._db.execute("SELECT id FROM sessions WHERE id = ?", (session_id,)) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                return False
+
+            await self._db.execute("DELETE FROM fts_messages WHERE session_id = ?", (session_id,))
+            await self._db.execute("DELETE FROM messages WHERE session_id = ?", (session_id,))
+            await self._db.execute("DELETE FROM sessions WHERE id = ?", (session_id,))
+            await self._db.commit()
+            return True
+        except Exception as exc:
+            logger.warning("delete_session(%s) failed: %s", session_id, exc)
+            return False
+
+    @hookimpl
+    async def rename_session(self, session_id: str, title: str) -> SessionData | None:
+        """Rename a persisted session by updating its metadata."""
+        if self._db is None:
+            await self.initialize()
+        if self._db is None:
+            return None
+
+        try:
+            async with self._db.execute("SELECT id, metadata FROM sessions WHERE id = ?", (session_id,)) as cursor:
+                row = await cursor.fetchone()
+            if row is None:
+                return None
+
+            metadata = json.loads(row["metadata"] or "{}")
+            metadata["title"] = title
+            now = _utcnow()
+            await self._db.execute(
+                "UPDATE sessions SET metadata = ?, updated_at = ? WHERE id = ?",
+                (json.dumps(metadata, ensure_ascii=False), now, session_id),
+            )
+            await self._db.commit()
+
+            # Return updated SessionData
+            messages = await self._load_messages(session_id)
+            import datetime as _datetime
+            import uuid as _uuid
+            return SessionData(
+                session_id=_uuid.UUID(session_id),
+                namespace=row["namespace"] if "namespace" in row.keys() else "default",
+                messages=tuple(messages),
+                memory=metadata,
+                created_at=_datetime.datetime.fromtimestamp(
+                    _utcnow(), tz=_datetime.timezone.utc
+                ),
+            )
+        except Exception as exc:
+            logger.warning("rename_session(%s) failed: %s", session_id, exc)
+            return None
+
+    @hookimpl
+    async def clear_sessions(self) -> int:
+        """Delete all persisted sessions and their messages from the store."""
+        if self._db is None:
+            await self.initialize()
+        if self._db is None:
+            return 0
+
+        try:
+            await self._db.execute("DELETE FROM fts_messages")
+            await self._db.execute("DELETE FROM messages")
+            await self._db.execute("DELETE FROM sessions")
+            await self._db.commit()
+            return 1  # SQLite doesn't return rowcount for DELETE without WHERE
+        except Exception as exc:
+            logger.warning("clear_sessions failed: %s", exc)
+            return 0
 
     # ------------------------------------------------------------------ #
     # Internals

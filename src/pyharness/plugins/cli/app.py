@@ -17,17 +17,16 @@ import asyncio
 from typing import Any
 
 import typer
-from pluggy import HookimplMarker
 from rich.console import Console
 
-from pyharness import Harness
 from pyharness.context import SessionContext
+from pyharness.factory import build_harness
 from pyharness.plugins.cli.ui import session_header, transcript_panel
-from pyharness.plugins.llm import entry as llm
-from pyharness.plugins.llm.http import DEFAULT_BASE
-from pyharness.schema import AgentConfig, Event, LLMResponse
+from pyharness.plugins.tool_python_exec import _DOCKER_IMAGE
+from pyharness.schema import AgentConfig
+from pyharness import Harness
+from pathlib import Path
 
-hookimpl = HookimplMarker("pyharness")
 console = Console(highlight=False)
 
 app = typer.Typer(
@@ -38,54 +37,17 @@ app = typer.Typer(
 _EXITS = {"/exit", "/quit", "exit", "quit", "/q"}
 
 
-class CliObserver:
-    """A tiny plugin that renders harness events to the terminal (--verbose)."""
-
-    @hookimpl
-    def observe(self, context: SessionContext, event: Event) -> None:
-        if event.type == "tool.called":
-            tool = event.payload.get("tool", "?")
-            console.print(f"   [dim]tool → {tool}[/]", soft_wrap=True)
-
-
-def _configure_provider(
-    provider: str,
-    models: tuple[str, ...],
-    api_key: str | None,
-    base_url: str | None,
-    replies: tuple[str, ...] = (),
-) -> None:
-    """Wire a provider into the shared LLM-plugin registry."""
-    llm.clear()
-    if provider == "dummy":
-        plan = [LLMResponse(model=models[0], content=text) for text in replies]
-        if not plan:
-            plan = [LLMResponse(model=models[0], content="PyHarness reply (dummy provider).")]
-        llm.use_dummy(models=models, plan=plan)
-    elif provider == "http":
-        llm.use_http(models=models, api_key=api_key, base_url=base_url or DEFAULT_BASE)
-    else:
-        raise typer.BadParameter(f"unknown provider {provider!r}; use 'dummy' or 'http'")
-
-
-def _harness(verbose: bool) -> Harness:
-    harness = Harness()  # auto-loads builtin + llm entry-points
-    from pyharness.plugins.tool_web import WebPlugin
-    from pyharness.plugins.tool_fs import FileSystemPlugin
-    from pyharness.plugins.workflow import WorkflowPlugin
-    from pyharness.plugins.tool_subagent import SubagentToolPlugin
-    from pyharness.plugins.session_store import SQLiteSessionStorePlugin
-    from pyharness.plugins.guard_approval import ApprovalGuardPlugin
-
-    harness.register_plugin(WebPlugin())
-    harness.register_plugin(FileSystemPlugin())
-    harness.register_plugin(WorkflowPlugin())
-    harness.register_plugin(SubagentToolPlugin())
-    harness.register_plugin(SQLiteSessionStorePlugin())
-    harness.register_plugin(ApprovalGuardPlugin())
-    if verbose:
-        harness.bus.register(CliObserver())
-    return harness
+def _harness(verbose: bool, model: str = "dummy", provider: str = "dummy", api_key: str | None = None, base_url: str | None = None) -> Harness:
+    try:
+        return build_harness(
+            model=model,
+            provider=provider,
+            api_key=api_key,
+            base_url=base_url,
+            verbose=verbose,
+        )
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc))
 
 
 # --------------------------------------------------------------------------- #
@@ -111,8 +73,7 @@ def run(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Render harness events."),
 ) -> None:
     """Run one user turn against an agent and print the transcript."""
-    _configure_provider(provider, (model,), api_key, base_url, replies=(initial,))
-    harness = _harness(verbose)
+    harness = _harness(verbose, model=model, provider=provider, api_key=api_key, base_url=base_url)
     agent = AgentConfig(name=name, model=model, system_prompt=system_prompt)
     session_header(console, agent=name, model=model, provider=provider)
 
@@ -141,8 +102,7 @@ def chat(
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Render harness events."),
 ) -> None:
     """Streaming REPL. `/new` resets context; `/exit` quits."""
-    _configure_provider(provider, (model,), api_key, base_url)
-    harness = _harness(verbose)
+    harness = _harness(verbose, model=model, provider=provider, api_key=api_key, base_url=base_url)
     agent = AgentConfig(name=name, model=model, system_prompt=system_prompt)
     console.print(f"[green]PyHarness chat[/] (model={model}) — /new to reset, /exit to quit.")
 
@@ -187,6 +147,115 @@ def serve(
     serve_web_ui(harness, host=host, port=port)
 
 
+@app.command("sandbox")
+def sandbox(
+    action: str = typer.Argument(..., help="Action: init"),
+) -> None:
+    """Manage the python_exec Docker sandbox."""
+    if action != "init":
+        raise typer.BadParameter(f"Unknown sandbox action: {action!r}; use 'init'")
+
+    from pyharness.plugins.tool_python_exec import PythonExecPlugin
+
+    plugin = PythonExecPlugin()
+    console.print("[cyan]Initializing Docker sandbox...[/]")
+    if asyncio.run(plugin.init_sandbox()):
+        console.print("[green]Sandbox initialized successfully.[/]")
+        console.print(f"Image: {_DOCKER_IMAGE}")
+    else:
+        console.print("[red]Failed to initialize sandbox. Is Docker installed and running?[/]")
+        raise typer.Exit(1)
+
+
+def _find_evals_dir() -> Path:
+    for base in Path(__file__).resolve().parents:
+        if (base / "evals").is_dir():
+            return base / "evals"
+    return Path.cwd() / "evals"
+
+
+@app.command("eval")
+def eval(
+    suite: str = typer.Option("basic", "--suite", "-s", help="Suite name (e.g. basic)."),
+    model: str = typer.Option("dummy", "--model", "-m", help="Model name for eval tasks."),
+    judge: str | None = typer.Option(None, "--judge", "-j", help="Judge model name."),
+    no_judge: bool = typer.Option(False, "--no-judge", help="Skip LLM judge, use programmatic only."),
+) -> None:
+    """Run the built-in evaluation suite."""
+    from pyharness.plugins.eval_runner import run_evals
+
+    suite_path = _find_evals_dir() / f"{suite}.yaml"
+    if not suite_path.exists():
+        console.print(f"[red]Suite not found: {suite_path}[/]")
+        raise typer.Exit(1)
+
+    console.print(f"[cyan]Running eval suite: {suite}[/]")
+    if no_judge:
+        console.print("[yellow]LLM judge disabled[/]")
+
+    report = asyncio.run(run_evals(suite_path=suite_path, judge_model=judge, model=model))
+    if report.failed_count > 0:
+        raise typer.Exit(1)
+
+
 main = app  # console-script entry point (`dsh-py`)
 
 __all__ = ["app", "main"]
+
+
+# --------------------------------------------------------------------------- #
+# Plugin lifecycle (hot-reload) — talks to a running `pyharness serve`
+# --------------------------------------------------------------------------- #
+@app.command("plugin")
+def plugin(
+    action: str = typer.Argument(..., help="list | load | unload | reload"),
+    target: str = typer.Argument(None, help="path (load) or name (unload/reload)"),
+    url: str = typer.Option("http://127.0.0.1:3080", "--url", help="Running serve URL"),
+) -> None:
+    """Hot-load / unload / reload plugins on a running server.
+
+    Examples::
+
+        pyharness plugin list
+        pyharness plugin load ./my_plugin.py
+        pyharness plugin reload my_plugin
+        pyharness plugin unload my_plugin
+    """
+    import httpx
+
+    endpoint = f"{url.rstrip('/')}/api/plugins"
+    try:
+        if action == "list":
+            resp = httpx.get(endpoint, timeout=10)
+        elif action == "load":
+            if not target:
+                raise typer.BadParameter("load 需要一个插件文件路径")
+            resp = httpx.post(endpoint + "/load", json={"path": target}, timeout=30)
+        elif action == "reload":
+            if not target:
+                raise typer.BadParameter("reload 需要一个插件名称")
+            resp = httpx.post(endpoint + "/reload", json={"name": target}, timeout=30)
+        elif action == "unload":
+            if not target:
+                raise typer.BadParameter("unload 需要一个插件名称")
+            resp = httpx.request("DELETE", endpoint + f"/{target}", timeout=30)
+        else:
+            raise typer.BadParameter(f"未知 action: {action!r} (list|load|unload|reload)")
+    except httpx.HTTPError as exc:
+        console.print(f"[red]无法连接 {url}: {exc}[/]")
+        raise typer.Exit(1)
+
+    try:
+        payload = resp.json()
+    except ValueError:
+        console.print(f"[red]服务器返回非 JSON ({resp.status_code}):[/]\n{resp.text}")
+        raise typer.Exit(1)
+
+    if isinstance(payload, dict) and payload.get("ok") is False:
+        console.print(f"[red]操作失败:[/] {payload.get('error', '未知错误')}")
+        raise typer.Exit(1)
+    if isinstance(payload, dict) and "error" in payload:
+        console.print(f"[red]错误:[/] {payload['error']}")
+        raise typer.Exit(1)
+
+    console.print_json(resp.text)
