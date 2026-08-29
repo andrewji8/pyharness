@@ -225,22 +225,24 @@ def plugin(
 
     endpoint = f"{url.rstrip('/')}/api/plugins"
     try:
-        if action == "list":
-            resp = httpx.get(endpoint, timeout=10)
-        elif action == "load":
-            if not target:
-                raise typer.BadParameter("load 需要一个插件文件路径")
-            resp = httpx.post(endpoint + "/load", json={"path": target}, timeout=30)
-        elif action == "reload":
-            if not target:
-                raise typer.BadParameter("reload 需要一个插件名称")
-            resp = httpx.post(endpoint + "/reload", json={"name": target}, timeout=30)
-        elif action == "unload":
-            if not target:
-                raise typer.BadParameter("unload 需要一个插件名称")
-            resp = httpx.request("DELETE", endpoint + f"/{target}", timeout=30)
-        else:
-            raise typer.BadParameter(f"未知 action: {action!r} (list|load|unload|reload)")
+        # CLI only talks to a local `pyharness serve`; bypass system proxy.
+        with httpx.Client(trust_env=False, timeout=30) as client:
+            if action == "list":
+                resp = client.get(endpoint, timeout=10)
+            elif action == "load":
+                if not target:
+                    raise typer.BadParameter("load 需要一个插件文件路径")
+                resp = client.post(endpoint + "/load", json={"path": target}, timeout=30)
+            elif action == "reload":
+                if not target:
+                    raise typer.BadParameter("reload 需要一个插件名称")
+                resp = client.post(endpoint + "/reload", json={"name": target}, timeout=30)
+            elif action == "unload":
+                if not target:
+                    raise typer.BadParameter("unload 需要一个插件名称")
+                resp = client.request("DELETE", endpoint + f"/{target}", timeout=30)
+            else:
+                raise typer.BadParameter(f"未知 action: {action!r} (list|load|unload|reload)")
     except httpx.HTTPError as exc:
         console.print(f"[red]无法连接 {url}: {exc}[/]")
         raise typer.Exit(1)

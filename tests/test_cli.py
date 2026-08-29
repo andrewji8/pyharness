@@ -7,6 +7,9 @@ be driven headlessly, so it's validated at the plumbing level (`--help`).
 
 from __future__ import annotations
 
+from unittest.mock import MagicMock, patch
+
+import httpx
 from typer.testing import CliRunner
 
 from pyharness.plugins.cli.app import app
@@ -43,3 +46,21 @@ def test_chat_command_plumbing() -> None:
     result = runner.invoke(app, ["chat", "--help"])
     assert result.exit_code == 0, result.output
     assert "--model" in result.output
+
+
+def test_plugin_command_bypasses_system_proxy() -> None:
+    """The CLI only talks to a local `pyharness serve`; it must build the
+    httpx client with ``trust_env=False`` so the OS/system proxy is ignored."""
+    fake_client = MagicMock()
+    # Simulate a refused local connection so the command handles it gracefully.
+    fake_client.__enter__.return_value.get.side_effect = httpx.ConnectError("refused")
+
+    with patch("httpx.Client", return_value=fake_client) as mock_cls:
+        result = runner.invoke(app, ["plugin", "list", "--url", "http://127.0.0.1:1"])
+
+    # The client was constructed with trust_env=False (no system proxy).
+    mock_cls.assert_called_once()
+    _, kwargs = mock_cls.call_args
+    assert kwargs.get("trust_env") is False
+    # Connection failure is surfaced as a non-zero exit, not a crash.
+    assert result.exit_code != 0
