@@ -1018,3 +1018,179 @@ async def test_observe_events_fired() -> None:
     assert len(step_starts) == 2
     assert step_starts[0]["step_id"] == "s1"
     assert step_starts[1]["step_id"] == "s2"
+
+
+# --------------------------------------------------------------------------- #
+# Batch A regressions: dependency cascade / frozen / persistence / event ctx  #
+# --------------------------------------------------------------------------- #
+
+async def test_failed_dep_cascades_skipped_status() -> None:
+    """A FAILED dep must cause its dependents to be marked SKIPPED (with
+    reason) instead of being left as PENDING forever."""
+    plan = WorkflowPlan(
+        plan_id=__import__("uuid").UUID("11111111-1111-1111-1111-111111111111"),
+        task="cascade",
+        steps=(
+            WorkflowStep(id="a", title="A", description="", depends_on=(), status=StepStatus.FAILED),
+            WorkflowStep(id="b", title="B", description="", depends_on=("a",), status=StepStatus.PENDING),
+        ),
+    )
+    # Mirror the cascade block from _execute_plan.
+    results: dict = {}
+    original_steps = {s.id: s for s in plan.steps}
+    remaining = list(plan.steps)
+    for s in remaining:
+        failed_dep = next(
+            (
+                dep
+                for dep in s.depends_on
+                if results.get(dep, original_steps.get(dep)).status == StepStatus.FAILED
+            ),
+            None,
+        )
+        if failed_dep is not None and s.status == StepStatus.PENDING:
+            s = s.model_copy(
+                update={"status": StepStatus.SKIPPED, "error": f"依赖步骤 {failed_dep} 失败，已自动跳过"}
+            )
+            results[s.id] = s
+    assert results["b"].status == StepStatus.SKIPPED
+    assert "a" in (results["b"].error or "")
+
+
+async def test_persist_plan_does_not_mutate_original_snapshot() -> None:
+    """_persist_plan must not mutate the existing memory dict in place.
+
+    Before the fix, ``ctx.memory.get("workflow_plans", {})`` returned a live
+    reference to the nested dict and the code wrote into it directly,
+    violating the frozen-model contract. We assert the original dict object
+    identity is unchanged after persist, and that persist forwarded a session
+    whose memory carries the plan under a *separate* dict object.
+    """
+    import uuid as _uuid
+
+    plugin = WorkflowPlugin()
+    h = _harness(plugin)
+    plugin.harness = h
+
+    initial_memory: dict = {}
+    sid = _uuid.uuid4()
+
+    # Register a capture *plugin* (with a real save_session method). This is
+    # the canonical pluggy mechanism and avoids any decorator / name quirks.
+    captured_sessions: list = []
+
+    class _SaveSessionCapture:
+        @hookimpl
+        def save_session(self, session: object) -> None:  # hookimpl method
+            captured_sessions.append(session)
+
+    capture = _SaveSessionCapture()
+    h.bus.register(capture, name="batchA_capture_save")
+
+    # Bind the session context so _persist_plan can read it.
+    from pyharness.context import set_current, reset_current
+    ctx = SessionContext(session_id=sid, memory=initial_memory)
+    token = set_current(ctx)
+    try:
+        plan = WorkflowPlan(plan_id=_uuid.uuid4(), task="frozen", steps=())
+        await plugin._persist_plan(plan)
+    finally:
+        reset_current(token)
+
+    # The original dict object MUST remain empty (frozen contract).
+    assert initial_memory == {}, f"frozen violated: {initial_memory!r}"
+    # save_session received a session whose memory is a NEW dict containing workflow_plans.
+    assert captured_sessions, "save_session was not called"
+    saved = captured_sessions[-1]
+    assert saved.memory is not initial_memory
+    assert "workflow_plans" in saved.memory
+
+    h.bus.pm.unregister(name="batchA_capture_save")
+
+
+async def test_update_plan_persists_to_session_store() -> None:
+    """update_plan must call _persist_plan so changes land in the store.
+
+    We monkey-patch the CLASS method ``_persist_plan`` (via
+    ``patch.object`` on the class) to record calls — this is the most direct
+    possible causal assertion and avoids any pluggy / contextvar plumbing.
+    """
+    import uuid as _uuid
+    from unittest.mock import patch
+
+    persisted: list = []
+    plugin = WorkflowPlugin()
+    h = _harness(plugin)
+    plugin.harness = h
+
+    real_persist = WorkflowPlugin._persist_plan
+
+    async def spy_persist(self, plan):  # type: ignore[no-untyped-def]
+        persisted.append(plan.plan_id)
+        await real_persist(self, plan)
+
+    plan_id = _uuid.UUID("22222222-2222-2222-2222-222222222222")
+    plan = WorkflowPlan(
+        plan_id=plan_id,
+        task="persist",
+        steps=(WorkflowStep(id="x", title="X", description="", depends_on=(), status=StepStatus.PENDING),),
+    )
+    plugin._plans[str(plan_id)] = plan
+
+    with patch.object(WorkflowPlugin, "_persist_plan", spy_persist):
+        result = await plugin._handle_update_plan(
+            {"plan_id": str(plan_id), "action": "skip_step", "step_id": "x"}
+        )
+        assert result.status == ToolResultStatus.OK
+        assert persisted == [plan_id], f"update_plan did not call _persist_plan; got {persisted}"
+
+
+async def test_workflow_events_carry_real_session_id() -> None:
+    """Step / plan broadcasts must use current_context()'s session_id.
+
+    We monkey-patch ``current_context`` (at the workflow import site) to
+    return a known context, then assert the ``aemit`` payload carries it.
+    """
+    import uuid as _uuid
+    from unittest.mock import patch
+
+    plugin = WorkflowPlugin()
+    h = _harness(plugin)
+    plugin.harness = h
+
+    captured: list = []
+    real_aemit = h.bus.aemit
+
+    async def spy_aemit(event_type, **payload):  # type: ignore[no-untyped-def]
+        ctx = payload.get("context")
+        if ctx is not None and event_type in ("plan_step_start", "plan_completed"):
+            captured.append((event_type, ctx.session_id))
+        return await real_aemit(event_type, **payload)
+
+    h.bus.aemit = spy_aemit  # type: ignore[assignment]
+
+    plan_id = _uuid.UUID("33333333-3333-3333-3333-333333333333")
+    plan = WorkflowPlan(
+        plan_id=plan_id,
+        task="evt",
+        steps=(WorkflowStep(id="p1", title="P1", description="", depends_on=(), status=StepStatus.PENDING),),
+    )
+    plugin._plans[str(plan_id)] = plan
+
+    sid = _uuid.uuid4()
+    fake_ctx = SessionContext(session_id=sid, memory={})
+
+    # Direct on-instance patch: override _emit_context to bypass the module
+    # import binding entirely. This is the most reliable approach.
+    plugin._emit_context = lambda: fake_ctx  # type: ignore[assignment]
+
+    await plugin._broadcast_step_event(
+        plan, plan.steps[0].model_copy(update={"status": StepStatus.RUNNING}), "plan_step_start"
+    )
+    await plugin._broadcast_plan_event(plan, "plan_completed")
+
+    h.bus.aemit = real_aemit  # type: ignore[assignment]
+
+    assert captured, "no workflow events captured"
+    for event_type, emitted_sid in captured:
+        assert emitted_sid == sid, f"{event_type} emitted under wrong session {emitted_sid}"

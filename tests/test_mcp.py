@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import tempfile
+import time
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -98,6 +99,43 @@ class TestStdioTransport:
         with pytest.raises(TimeoutError):
             await transport.send_request("test", timeout=0.5)
         await transport.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_pending_request_fails_when_subprocess_dies(self) -> None:
+        """If the child process exits while a request is in-flight, the
+        pending future must be failed with ``ConnectionError`` immediately
+        instead of waiting for the 30s default timeout."""
+        # Script that reads one line then exits (no response).
+        transport = StdioTransport(
+            "python", ["-c", "import sys; sys.stdin.readline(); raise SystemExit(7)"]
+        )
+        await transport.connect()
+        try:
+            # Bound the wait generously above the 30s default to prove the
+            # reader's finally-clause short-circuits the wait.
+            start = time.monotonic()
+            with pytest.raises(ConnectionError):
+                await transport.send_request("ping", timeout=30.0)
+            elapsed = time.monotonic() - start
+            assert elapsed < 5.0, f"send_request waited {elapsed:.1f}s (expected <5s)"
+            # After the failure, the transport must have cleared its pending map.
+            assert transport._pending == {}
+        finally:
+            await transport.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_stderr_drain_task_is_running(self) -> None:
+        """connect() must spawn a stderr drain task to avoid deadlocking the
+        child on a full stderr pipe."""
+        transport = StdioTransport("python", ["-c", "import time; time.sleep(0.2)"])
+        await transport.connect()
+        try:
+            assert transport._stderr_task is not None
+            assert not transport._stderr_task.done()
+        finally:
+            await transport.disconnect()
+        # disconnect must cancel the drain task.
+        assert transport._stderr_task is None or transport._stderr_task.done()
 
 
 # ---------------------------------------------------------------------------

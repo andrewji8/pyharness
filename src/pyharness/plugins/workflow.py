@@ -83,11 +83,19 @@ class WorkflowPlugin:
                 pass
 
     async def _persist_plan(self, plan: WorkflowPlan) -> None:
-        """Persist plan state to the current session context."""
+        """Persist plan state to the current session context.
+
+        ``SessionContext`` is a frozen model — we must never mutate nested
+        dicts in place. We always:
+          1. shallow-copy the ``workflow_plans`` mapping,
+          2. write the new entry into the copy,
+          3. wrap it in a fresh ``memory`` dict,
+          4. ``model_copy`` the context to derive a new snapshot.
+        """
         ctx = current_context()
         if ctx is None or self.harness is None:
             return
-        plans_memory = ctx.memory.get("workflow_plans", {})
+        plans_memory = dict(ctx.memory.get("workflow_plans", {}))
         plans_memory[str(plan.plan_id)] = plan.model_dump(mode="json")
         new_memory = {**ctx.memory, "workflow_plans": plans_memory}
         new_ctx = ctx.model_copy(update={"memory": new_memory})
@@ -117,12 +125,20 @@ class WorkflowPlugin:
         self._plans[str(plan.plan_id)] = plan
         await self._persist_plan(plan)
 
+    def _emit_context(self) -> SessionContext:
+        """Return the current session context for event payloads.
+
+        Falls back to a fresh empty ``SessionContext`` when no session is
+        active so the broadcast layer is never asked to emit without one.
+        """
+        return current_context() or SessionContext()
+
     async def _broadcast_step_event(self, plan: WorkflowPlan, step: WorkflowStep, event: str) -> None:
         """Broadcast a step-level event via the event bus."""
         try:
             await self.harness.bus.aemit(
                 event,
-                context=SessionContext(),
+                context=self._emit_context(),
                 plan_id=str(plan.plan_id),
                 plan_goal=plan.task,
                 step_id=step.id,
@@ -139,7 +155,7 @@ class WorkflowPlugin:
         try:
             await self.harness.bus.aemit(
                 event,
-                context=SessionContext(),
+                context=self._emit_context(),
                 plan_id=str(plan.plan_id),
                 plan_goal=plan.task,
                 plan_status=plan.status,
@@ -438,6 +454,7 @@ class WorkflowPlugin:
             await _settle(
                 self.harness.bus.pm.hook.on_plan_update(plan=updated_plan)
             )
+        await self._persist_plan(updated_plan)
         return ToolResult(
             tool_name="update_plan",
             status=ToolResultStatus.OK,
@@ -622,13 +639,40 @@ class WorkflowPlugin:
         await self._broadcast_plan_event(plan, "plan_created")
 
         while remaining:
-            ready = [
-                s for s in remaining
-                if all(
-                    dep in results or original_status.get(dep) in (StepStatus.COMPLETED, StepStatus.SKIPPED)
-                    for dep in s.depends_on
+            # Cascade-fail: any remaining step whose dep has FAILED must be
+            # marked SKIPPED with an explicit reason so it never lingers as
+            # "remaining" forever.
+            def _step_status(dep: str):
+                if dep in results:
+                    return results[dep].status
+                return original_steps.get(dep, None).status if dep in original_steps else None
+
+            for s in remaining:
+                failed_dep = next(
+                    (dep for dep in s.depends_on if _step_status(dep) == StepStatus.FAILED),
+                    None,
                 )
-            ]
+                if failed_dep is not None and s.status == StepStatus.PENDING:
+                    s = s.model_copy(
+                        update={
+                            "status": StepStatus.SKIPPED,
+                            "error": f"依赖步骤 {failed_dep} 失败，已自动跳过",
+                        }
+                    )
+                    results[s.id] = s
+                    await _settle(
+                        self.harness.bus.pm.hook.on_step_update(
+                            plan_id=str(plan.plan_id), step=s
+                        )
+                    )
+                    await self._broadcast_step_event(plan, s, "plan_step_complete")
+            remaining = [s for s in remaining if s.id not in results]
+
+            def _dep_satisfied(dep: str) -> bool:
+                st = _step_status(dep)
+                return st in (StepStatus.COMPLETED, StepStatus.SKIPPED)
+
+            ready = [s for s in remaining if all(_dep_satisfied(dep) for dep in s.depends_on)]
 
             if not ready:
                 for s in remaining:

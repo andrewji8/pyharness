@@ -30,6 +30,7 @@ class StdioTransport:
         self._request_id = 0
         self._pending: dict[int, asyncio.Future] = {}
         self._reader_task: asyncio.Task | None = None
+        self._stderr_task: asyncio.Task | None = None
 
     async def connect(self) -> None:
         """Start the subprocess and begin reading responses."""
@@ -45,6 +46,9 @@ class StdioTransport:
             env=full_env,
         )
         self._reader_task = asyncio.create_task(self._read_loop())
+        # Drain stderr in the background; without this the child can block on
+        # a full stderr pipe and wedge the whole transport.
+        self._stderr_task = asyncio.create_task(self._drain_stderr())
 
     async def send_request(self, method: str, params: dict[str, Any] | None = None, timeout: float = 30.0) -> dict[str, Any]:
         """Send a JSON-RPC request and return the result payload."""
@@ -73,25 +77,55 @@ class StdioTransport:
     async def _read_loop(self) -> None:
         """Background task: read JSON-RPC responses from stdout."""
         assert self.process and self.process.stdout
-        while True:
-            line = await self.process.stdout.readline()
-            if not line:
-                break
-            try:
-                msg = json.loads(line.decode().strip())
-                req_id = msg.get("id")
-                if req_id is not None and req_id in self._pending:
-                    future = self._pending.pop(req_id)
-                    if "result" in msg:
-                        future.set_result(msg["result"])
-                    elif "error" in msg:
-                        future.set_exception(RuntimeError(f"MCP error: {msg['error']}"))
-                    else:
-                        future.set_result({})
-            except (json.JSONDecodeError, UnicodeDecodeError):
-                continue
-            except Exception as exc:
-                logger.debug("StdioTransport reader error: %s", exc)
+        try:
+            while True:
+                line = await self.process.stdout.readline()
+                if not line:
+                    break
+                try:
+                    msg = json.loads(line.decode().strip())
+                    req_id = msg.get("id")
+                    if req_id is not None and req_id in self._pending:
+                        future = self._pending.pop(req_id)
+                        if "result" in msg:
+                            future.set_result(msg["result"])
+                        elif "error" in msg:
+                            future.set_exception(RuntimeError(f"MCP error: {msg['error']}"))
+                        else:
+                            future.set_result({})
+                except (json.JSONDecodeError, UnicodeDecodeError):
+                    continue
+                except Exception as exc:
+                    logger.debug("StdioTransport reader error: %s", exc)
+        finally:
+            # Reader exited (EOF or process died) — fail every still-pending
+            # request immediately so callers don't wait out the full timeout.
+            self._fail_pending(ConnectionError("MCP server terminated"))
+
+    def _fail_pending(self, exc: BaseException) -> None:
+        """Cancel all in-flight request futures with ``exc``."""
+        for fut in self._pending.values():
+            if not fut.done():
+                fut.set_exception(exc)
+        self._pending.clear()
+
+    async def _drain_stderr(self) -> None:
+        """Background task: read stderr and log at debug level.
+
+        This must keep running or the child process can block once its stderr
+        pipe buffer fills up.
+        """
+        assert self.process and self.process.stderr
+        try:
+            while True:
+                line = await self.process.stderr.readline()
+                if not line:
+                    break
+                logger.debug("StdioTransport stderr: %s", line.decode(errors="replace").rstrip())
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("StdioTransport stderr drain error: %s", exc)
 
     async def disconnect(self) -> None:
         """Terminate the subprocess and clean up."""
@@ -101,6 +135,12 @@ class StdioTransport:
                 await self._reader_task
             except asyncio.CancelledError:
                 pass
+        if self._stderr_task and not self._stderr_task.done():
+            self._stderr_task.cancel()
+            try:
+                await self._stderr_task
+            except asyncio.CancelledError:
+                pass
         if self.process and self.process.returncode is None:
             self.process.terminate()
             try:
@@ -108,8 +148,9 @@ class StdioTransport:
             except asyncio.TimeoutError:
                 self.process.kill()
                 await self.process.wait()
+        # Make sure no caller is left hanging on a pending request.
+        self._fail_pending(ConnectionError("StdioTransport disconnected"))
         self.process = None
-        self._pending.clear()
 
 
 class SSETransport:
