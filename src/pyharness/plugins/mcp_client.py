@@ -139,6 +139,11 @@ class MCPClientPlugin:
                 "tools/call",
                 {"name": mapping.tool_name, "arguments": arguments},
             )
+            # TODO: Bridge MCP streaming to tool_emitter when SDK supports
+            # streaming callbacks. When the underlying MCP SDK provides a
+            # streaming transport (e.g. MCPProtocol.streamingCallTool),
+            # forward each chunk through context.tool_emitter as
+            # ToolStreamEvent(tool_name=tool.name, stream_type="log", content=chunk).
             mcp_result = MCPToolResult(
                 content=result.get("content", []),
                 is_error=result.get("isError", False),

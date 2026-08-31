@@ -12,13 +12,19 @@ import asyncio
 import json
 import logging
 import os
-import time
 from collections.abc import AsyncIterator
 from typing import Any
 
 logger = logging.getLogger("pyharness.llm.http")
 
 _LLM_DIRECT = os.environ.get("LLM_DIRECT") == "1"
+
+# Optional vision routing: when a request carries an image but the current model
+# is not on the whitelist, transparently switch to the configured vision model.
+_VISION_MODEL = os.environ.get("PYHARNESS_VISION_MODEL") or ""
+_VISION_WHITELIST = {
+    m.strip() for m in (os.environ.get("PYHARNESS_VISION_MODELS") or "").split(",") if m.strip()
+}
 
 from pyharness.plugins.llm.provider import Provider
 from pyharness.schema import LLMRequest, LLMResponse, LLMStreamChunk, ToolCall
@@ -74,10 +80,70 @@ class HTTPProvider(Provider):
                 normalized[key] = value
         return normalized
 
+    def _effective_model(self, request: LLMRequest) -> str:
+        """Resolve the model to use, applying vision routing if needed.
+
+        Switch to ``PYHARNESS_VISION_MODEL`` (when configured) when the request
+        carries an image part, the whitelist is empty, *or* the current model is
+        outside the whitelist, and the current model is not already the vision
+        model. This guarantees routing works with only ``PYHARNESS_VISION_MODEL``
+        set (no whitelist required).
+        """
+        if not _VISION_MODEL:
+            return request.model
+        if request.model == _VISION_MODEL:
+            return request.model
+        has_image = any(
+            any(p.type == "image" for p in m.parts) for m in request.messages
+        )
+        if not has_image:
+            return request.model
+        if not _VISION_WHITELIST or request.model not in _VISION_WHITELIST:
+            logger.info(
+                "vision routing: model %r not in whitelist %s, switching to %r for this request",
+                request.model,
+                sorted(_VISION_WHITELIST),
+                _VISION_MODEL,
+            )
+            return _VISION_MODEL
+        return request.model
+
+    @staticmethod
+    def _content_block(part: Any) -> dict[str, Any] | None:
+        """Translate a :class:`ContentPart` into an OpenAI content-array item.
+
+        ``text`` → ``{"type": "text", "text": ...}``; ``image`` →
+        ``{"type": "image_url", "image_url": {"url": ...}}`` (the ``url`` may be
+        an http(s) URL or a base64 ``data:`` URL). Returns ``None`` for parts
+        that must be dropped.
+        """
+        ptype = getattr(part, "type", None)
+        if ptype == "text":
+            if part.text:
+                return {"type": "text", "text": part.text}
+            return None
+        if ptype == "image":
+            if part.url:
+                return {"type": "image_url", "image_url": {"url": part.url}}
+            logger.warning("image ContentPart has no url; skipping")
+            return None
+        return None
+
     def _messages_payload(self, request: LLMRequest) -> list[dict[str, Any]]:
         messages: list[dict[str, Any]] = []
         for m in request.messages:
-            msg: dict[str, Any] = {"role": m.role.value, "content": m.content}
+            # Multimodal path: build an OpenAI content array from parts.
+            if m.parts:
+                blocks: list[dict[str, Any]] = []
+                # A non-empty legacy ``content`` string is prepended as the first
+                # text block so ``content`` and ``parts`` coexist on the wire.
+                if m.content:
+                    blocks.append({"type": "text", "text": m.content})
+                blocks.extend(b for b in (self._content_block(p) for p in m.parts) if b)
+                content: Any = blocks if blocks else m.content
+            else:
+                content = m.content
+            msg: dict[str, Any] = {"role": m.role.value, "content": content}
             if m.name:
                 msg["name"] = m.name
             if m.tool_calls:
@@ -114,7 +180,7 @@ class HTTPProvider(Provider):
         import httpx
 
         payload = {
-            "model": request.model,
+            "model": self._effective_model(request),
             "messages": self._messages_payload(request),
             "temperature": request.temperature,
             "stream": False,
@@ -153,7 +219,7 @@ class HTTPProvider(Provider):
         import httpx
 
         payload = {
-            "model": request.model,
+            "model": self._effective_model(request),
             "messages": self._messages_payload(request),
             "temperature": request.temperature,
             "stream": True,

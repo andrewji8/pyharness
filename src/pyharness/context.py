@@ -25,11 +25,11 @@ import uuid
 from contextlib import asynccontextmanager
 from contextvars import ContextVar, Token
 from datetime import datetime
-from typing import Any, AsyncIterator
+from typing import Any, AsyncIterator, Awaitable, Callable
 
 from pydantic import Field
 
-from pyharness.schema import Frozen, Message, _utcnow
+from pyharness.schema import Frozen, Message, ToolStreamEvent, _utcnow
 
 # Task-scoped handle to the "current" session snapshot.
 _current_context: ContextVar["SessionContext | None"] = ContextVar(
@@ -69,6 +69,12 @@ class SessionContext(Frozen):
 
     messages: tuple[Message, ...] = Field(default_factory=tuple)
     memory: dict[str, Any] = Field(default_factory=dict)
+
+    # Optional streaming sink for long-running tools. ``execute_tool`` hookimpls
+    # may push partial output via this callback; ``None`` means "not streaming".
+    tool_emitter: Callable[[ToolStreamEvent], Awaitable[None]] | None = Field(
+        default=None, description="Optional streaming sink for intermediate tool output."
+    )
 
     metadata: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=_utcnow)

@@ -47,6 +47,37 @@ class AgentHooks:
     def harness_shutdown(self, harness: "Harness") -> None:
         """Emitted on graceful shutdown. Use for resource cleanup."""
 
+    @hookspec
+    def plugin_loaded(self, harness: "Harness", name: str) -> None:
+        """Emitted after a plugin is dynamically loaded (hot-reload).
+
+        Plugins that need to capture the harness reference or spin up
+        connections should implement this (in addition to ``harness_initialized``).
+
+        Parameters
+        ----------
+        harness:
+            The live harness the plugin was loaded into.
+        name:
+            The registry name the plugin was registered under.
+        """
+
+    @hookspec
+    def plugin_unloaded(self, harness: "Harness", name: str) -> None:
+        """Emitted before a plugin is dynamically unloaded.
+
+        Plugins should release resources here (child processes, network
+        connections, file handles). The plugin is still registered when this
+        hook fires, so it can still reach its own state via the ``name``.
+
+        Parameters
+        ----------
+        harness:
+            The live harness the plugin is being removed from.
+        name:
+            The registry name the plugin is registered under.
+        """
+
     # -- Session lifecycle -------------------------------------------------- #
     @hookspec
     def session_started(self, context: SessionContext, agent: AgentConfig | None = None) -> None:
@@ -83,6 +114,29 @@ class AgentHooks:
         (best matches first). Store plugins with FTS or similar indexes should
         implement this hook; if no plugin answers, the engine treats it as an
         empty result set."""
+
+    @hookspec
+    async def delete_session(self, session_id: str) -> bool:
+        """Delete a persisted session and all its messages from the store.
+
+        Return ``True`` when the session existed and was removed, ``False``
+        when the session was already absent. Implementations must also clean
+        up any secondary indexes (FTS, metadata, etc.)."""
+
+    @hookspec
+    async def rename_session(self, session_id: str, title: str) -> SessionData | None:
+        """Rename a persisted session.
+
+        Return the updated :class:`SessionData` on success, or ``None`` when
+        the session does not exist. Implementations may store the title in
+        ``metadata`` or a dedicated column."""
+
+    @hookspec
+    async def clear_sessions(self) -> int:
+        """Delete all persisted sessions and their messages from the store.
+
+        Return the number of sessions removed. Implementations must also
+        clean up any secondary indexes (FTS, metadata, etc.)."""
 
     @hookspec
     async def spawn_subagent(self, spec: SubagentSpec, parent_tools: list[ToolSpec], parent_config: AgentConfig) -> SubagentResult:

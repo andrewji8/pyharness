@@ -20,9 +20,12 @@ Dependencies
 
 from __future__ import annotations
 
+import ipaddress
 import logging
 import os
+import socket
 from typing import Any
+from urllib.parse import urljoin, urlparse
 
 from pluggy import HookimplMarker
 
@@ -45,6 +48,42 @@ try:
     _BS4_AVAILABLE = True
 except ImportError:  # pragma: no cover
     _BS4_AVAILABLE = False
+
+
+# SSRF guard: loopback / private / link-local / cloud-metadata ranges are never
+# fetched. Redirects are re-validated on every hop (see ``_fetch``).
+_BLOCKED_NETWORKS = tuple(
+    ipaddress.ip_network(n)
+    for n in (
+        "0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8",
+        "169.254.0.0/16", "172.16.0.0/12", "192.0.0.0/24", "192.168.0.0/16",
+        "198.18.0.0/15", "224.0.0.0/4", "240.0.0.0/4",
+        "::1/128", "fc00::/7", "fe80::/10",
+    )
+)
+_MAX_REDIRECTS = 3
+
+
+def _assert_public_http_url(url: str) -> None:
+    """Raise ``PermissionError`` unless ``url`` is http(s) to a public address.
+
+    Every A/AAAA record of the host is resolved and checked, so a DNS name
+    pointing at an internal address is blocked just like a literal IP.
+    """
+    parsed = urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise PermissionError(f"仅允许 http/https 协议: {url!r}")
+    host = parsed.hostname
+    if not host:
+        raise PermissionError(f"URL 缺少主机名: {url!r}")
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as exc:
+        raise PermissionError(f"无法解析主机 {host!r}: {exc}") from exc
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if any(ip in net for net in _BLOCKED_NETWORKS):
+            raise PermissionError(f"禁止访问内网/保留地址: {host} -> {ip}")
 
 
 class WebPlugin:
@@ -144,21 +183,41 @@ class WebPlugin:
 
         try:
             async with httpx.AsyncClient(
-                follow_redirects=True,
+                follow_redirects=False,  # redirects re-validated hop by hop (SSRF)
                 timeout=self.timeout,
                 headers={"User-Agent": self.user_agent},
             ) as client:
-                resp = await client.get(url)
-                resp.raise_for_status()
-                content_type = resp.headers.get("content-type", "")
-                text = self._extract_text(resp.text, content_type)
-                if len(text) > self.max_content_chars:
-                    text = text[: self.max_content_chars] + f"\n\n...[已截断，共 {len(text)} 字符]"
+                current = url
+                for _ in range(_MAX_REDIRECTS + 1):
+                    # Validate EVERY hop: a redirect can point back inside the
+                    # private network even when the first URL was public.
+                    _assert_public_http_url(current)
+                    resp = await client.get(current)
+                    if resp.is_redirect:
+                        location = resp.headers.get("location", "")
+                        if not location:
+                            break
+                        current = urljoin(current, location)
+                        continue
+                    resp.raise_for_status()
+                    content_type = resp.headers.get("content-type", "")
+                    text = self._extract_text(resp.text, content_type)
+                    if len(text) > self.max_content_chars:
+                        text = text[: self.max_content_chars] + f"\n\n...[已截断，共 {len(text)} 字符]"
+                    return ToolResult(
+                        tool_name="web_fetch",
+                        status=ToolResultStatus.OK,
+                        output={"url": current, "title": self._guess_title(resp.text), "content": text, "content_type": content_type},
+                    )
                 return ToolResult(
                     tool_name="web_fetch",
-                    status=ToolResultStatus.OK,
-                    output={"url": url, "title": self._guess_title(resp.text), "content": text, "content_type": content_type},
+                    status=ToolResultStatus.ERROR,
+                    error=f"重定向次数超过上限（{_MAX_REDIRECTS}）。",
+                    output={"url": url},
                 )
+        except PermissionError as exc:
+            logger.warning("web_fetch blocked: %s", exc)
+            return ToolResult(tool_name="web_fetch", status=ToolResultStatus.ERROR, error=f"已拦截: {exc}", output={"url": url})
         except httpx.HTTPStatusError as exc:
             return ToolResult(
                 tool_name="web_fetch", status=ToolResultStatus.ERROR, error=f"HTTP {exc.response.status_code}: {exc.response.reason_phrase}", output={"url": url}

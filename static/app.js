@@ -29,6 +29,7 @@
         btnSend: document.getElementById('btn-send'),
         btnNewSession: document.getElementById('btn-new-session'),
         btnSearch: document.getElementById('btn-search'),
+        btnClearSessions: document.getElementById('btn-clear-sessions'),
         searchModal: document.getElementById('search-modal'),
         searchInput: document.getElementById('search-input'),
         btnDoSearch: document.getElementById('btn-do-search'),
@@ -120,6 +121,11 @@
 
             case 'plan_completed':
                 showPlanSummary(data);
+                break;
+
+            case 'subagent_start':
+            case 'subagent_complete':
+                updateSubagentStatus(data);
                 break;
 
             case 'session.started':
@@ -313,14 +319,31 @@
     // ------------------------------------------------------------------
     function updateSubagentStatus(data) {
         dom.subagentEmpty.style.display = 'none';
-        const item = document.createElement('div');
-        item.className = 'subagent-item';
+        const name = data.spec?.name || data.name || 'subagent';
+        const escapedName = escapeHtml(name);
         const statusClass = data.status === 'ok' ? 'running' : 'failed';
-        item.innerHTML = `
-            <span class="subagent-status ${statusClass}"></span>
-            <span class="subagent-name">${escapeHtml(data.spec?.name || data.name || 'subagent')}</span>
-        `;
-        dom.subagentList.appendChild(item);
+        const statusText = data.status === 'ok' ? 'running' : (data.status === 'timeout' ? 'timeout' : 'failed');
+
+        let item = Array.from(dom.subagentList.children).find(
+            el => el.dataset.subagentName === name
+        );
+
+        if (!item) {
+            item = document.createElement('div');
+            item.className = 'subagent-item';
+            item.dataset.subagentName = name;
+            item.innerHTML = `
+                <span class="subagent-status ${statusClass}"></span>
+                <span class="subagent-name">${escapedName}</span>
+            `;
+            dom.subagentList.appendChild(item);
+        } else {
+            const statusEl = item.querySelector('.subagent-status');
+            if (statusEl) {
+                statusEl.className = 'subagent-status ' + statusClass;
+                statusEl.title = statusText;
+            }
+        }
     }
 
     // ------------------------------------------------------------------
@@ -350,10 +373,215 @@
             div.innerHTML = `
                 <div class="session-item-title">会话 ${session.session_id.slice(0, 8)}</div>
                 <div class="session-item-meta">${date} · ${session.message_count || 0} 条消息</div>
+                <button class="session-item-menu-btn" data-session-id="${session.session_id}">⋯</button>
             `;
-            div.addEventListener('click', () => loadSession(session.session_id));
+            const menuBtn = div.querySelector('.session-item-menu-btn');
+            menuBtn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                showSessionContextMenu(e, session);
+            });
+            div.addEventListener('contextmenu', (e) => {
+                e.preventDefault();
+                showSessionContextMenu(e, session);
+            });
+            div.addEventListener('click', (e) => {
+                if (e.target.classList.contains('session-item-menu-btn')) return;
+                loadSession(session.session_id);
+            });
             dom.sessionList.appendChild(div);
         });
+    }
+
+    function showSessionContextMenu(event, session) {
+        hideSessionContextMenu();
+        const menu = document.createElement('div');
+        menu.className = 'session-context-menu';
+        menu.style.left = event.clientX + 'px';
+        menu.style.top = event.clientY + 'px';
+        menu.innerHTML = `
+            <div class="session-context-menu-item" data-action="download-md">下载 Markdown</div>
+            <div class="session-context-menu-item" data-action="export-json">导出 JSON</div>
+            <div class="session-context-menu-item" data-action="copy">复制对话</div>
+            <div class="session-context-menu-item" data-action="rename">重命名</div>
+            <div class="session-context-menu-item danger" data-action="delete">删除</div>
+        `;
+        document.body.appendChild(menu);
+        menu.querySelectorAll('.session-context-menu-item').forEach(item => {
+            item.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const action = item.dataset.action;
+                hideSessionContextMenu();
+                handleSessionAction(action, session);
+            });
+        });
+        document.addEventListener('click', hideSessionContextMenu);
+        document.addEventListener('contextmenu', hideSessionContextMenu);
+    }
+
+    function hideSessionContextMenu() {
+        const existing = document.querySelector('.session-context-menu');
+        if (existing) existing.remove();
+        document.removeEventListener('click', hideSessionContextMenu);
+        document.removeEventListener('contextmenu', hideSessionContextMenu);
+    }
+
+    async function handleSessionAction(action, session) {
+        switch (action) {
+            case 'download-md':
+                await downloadSessionMarkdown(session);
+                break;
+            case 'export-json':
+                exportSessionJson(session);
+                break;
+            case 'copy':
+                await copySessionToClipboard(session);
+                break;
+            case 'rename':
+                await renameSession(session);
+                break;
+            case 'delete':
+                await deleteSession(session);
+                break;
+        }
+    }
+
+    async function downloadSessionMarkdown(session) {
+        try {
+            const res = await fetch(`/api/sessions/${session.session_id}`);
+            const data = await res.json();
+            if (data.error) {
+                addSystemMessage(`加载会话失败: ${data.error}`);
+                return;
+            }
+            const lines = [`# 会话 ${session.session_id.slice(0, 8)}`, ''];
+            (data.messages || []).forEach(msg => {
+                if (msg.role === 'user') {
+                    lines.push('## 用户');
+                    lines.push(msg.content);
+                } else if (msg.role === 'assistant') {
+                    lines.push('## 助手');
+                    lines.push(msg.content);
+                } else if (msg.role === 'tool') {
+                    lines.push('## 工具: ' + (msg.name || ''));
+                    lines.push(msg.content);
+                }
+                lines.push('');
+            });
+            const blob = new Blob([lines.join('\n')], { type: 'text/markdown' });
+            const url = URL.createObjectURL(blob);
+            const a = document.createElement('a');
+            a.href = url;
+            const date = new Date().toISOString().slice(0, 10);
+            a.download = `pyharness_${session.session_id.slice(0, 8)}_${date}.md`;
+            a.click();
+            URL.revokeObjectURL(url);
+        } catch (e) {
+            console.error('Failed to download markdown:', e);
+        }
+    }
+
+    function exportSessionJson(session) {
+        const a = document.createElement('a');
+        a.href = `/api/sessions/${session.session_id}`;
+        a.download = `pyharness_${session.session_id.slice(0, 8)}.json`;
+        a.click();
+    }
+
+    async function copySessionToClipboard(session) {
+        try {
+            const res = await fetch(`/api/sessions/${session.session_id}`);
+            const data = await res.json();
+            if (data.error) {
+                addSystemMessage(`加载会话失败: ${data.error}`);
+                return;
+            }
+            const lines = [`# 会话 ${session.session_id.slice(0, 8)}`, ''];
+            (data.messages || []).forEach(msg => {
+                if (msg.role === 'user') {
+                    lines.push('## 用户');
+                    lines.push(msg.content);
+                } else if (msg.role === 'assistant') {
+                    lines.push('## 助手');
+                    lines.push(msg.content);
+                } else if (msg.role === 'tool') {
+                    lines.push('## 工具: ' + (msg.name || ''));
+                    lines.push(msg.content);
+                }
+                lines.push('');
+            });
+            const text = lines.join('\n');
+            if (navigator.clipboard && navigator.clipboard.writeText) {
+                await navigator.clipboard.writeText(text);
+            } else {
+                const textarea = document.createElement('textarea');
+                textarea.value = text;
+                document.body.appendChild(textarea);
+                textarea.select();
+                document.execCommand('copy');
+                document.body.removeChild(textarea);
+            }
+            showToast('已复制');
+        } catch (e) {
+            console.error('Failed to copy:', e);
+        }
+    }
+
+    async function renameSession(session) {
+        const title = prompt('输入新名称:', session.title || '');
+        if (title === null) return;
+        const trimmed = title.trim();
+        if (!trimmed) return;
+        try {
+            const res = await fetch(`/api/sessions/${session.session_id}`, {
+                method: 'PATCH',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ title: trimmed }),
+            });
+            const data = await res.json();
+            if (data.error) {
+                addSystemMessage(`重命名失败: ${data.error}`);
+                return;
+            }
+            addSystemMessage(`已重命名为: ${trimmed}`);
+            refreshSessionList();
+        } catch (e) {
+            console.error('Failed to rename:', e);
+        }
+    }
+
+    async function deleteSession(session) {
+        if (!confirm('确定要删除此会话吗？此操作不可恢复。')) return;
+        try {
+            const res = await fetch(`/api/sessions/${session.session_id}`, {
+                method: 'DELETE',
+            });
+            const data = await res.json();
+            if (data.deleted) {
+                addSystemMessage('会话已删除');
+                if (state.currentSessionId === session.session_id) {
+                    state.currentSessionId = null;
+                    dom.chatMessages.innerHTML = '';
+                    updateChatHeader(null);
+                }
+                refreshSessionList();
+            } else {
+                addSystemMessage(data.error || '删除失败');
+            }
+        } catch (e) {
+            console.error('Failed to delete:', e);
+        }
+    }
+
+    function showToast(message) {
+        let toast = document.querySelector('.toast');
+        if (!toast) {
+            toast = document.createElement('div');
+            toast.className = 'toast';
+            document.body.appendChild(toast);
+        }
+        toast.textContent = message;
+        toast.classList.add('show');
+        setTimeout(() => toast.classList.remove('show'), 2000);
     }
 
     async function loadSession(sessionId) {
@@ -474,6 +702,36 @@
         dom.searchModal.addEventListener('click', (e) => {
             if (e.target === dom.searchModal) closeSearch();
         });
+
+        dom.btnClearSessions.addEventListener('click', clearAllSessions);
+    }
+
+    async function clearAllSessions() {
+        if (!confirm('确定要清空所有历史记录吗？此操作不可恢复！')) return;
+        try {
+            const res = await fetch('/api/sessions', { method: 'DELETE' });
+            const data = await res.json();
+            if (data.status === 'ok') {
+                showToast(`已清空 ${data.cleared_count} 条会话`);
+                state.currentSessionId = null;
+                dom.chatMessages.innerHTML = `
+                    <div class="welcome">
+                        <h2>👋 欢迎使用 PyHarness</h2>
+                        <p>发送消息开始与 Agent 对话</p>
+                    </div>
+                `;
+                dom.planEmpty.style.display = 'block';
+                dom.planContent.style.display = 'none';
+                dom.subagentEmpty.style.display = 'block';
+                dom.subagentList.innerHTML = '';
+                updateChatHeader(null);
+                refreshSessionList();
+            } else {
+                showToast('清空失败');
+            }
+        } catch (e) {
+            console.error('Failed to clear sessions:', e);
+        }
     }
 
     function sendUserMessage() {

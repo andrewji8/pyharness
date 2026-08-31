@@ -44,9 +44,17 @@ Thumbs.db
 *.tar.gz
 *.whl
 
+# Eval reports
+eval_reports/
+
 # Environment / secrets
 .env
 *.npz
-pyharness_sessions.db
+*.db
 fib.txt
 python313.md
+
+# Dev / scratch artifacts (not part of release)
+.workspace/
+fix_eval_path.py
+release_070.ps1

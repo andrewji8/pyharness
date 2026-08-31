@@ -131,6 +131,66 @@ asyncio.run(main())
 
 ---
 
+## 🌐 Distributed Deployment
+
+PyHarness ships a distributed agent cluster built on Redis. Tool execution is
+offloaded from the web node to independent `pyharness worker` processes via a
+Redis task queue, with events fanned out over a Redis Pub/Sub event bus and
+sessions shared through a Redis store. If Redis is unavailable, PyHarness
+degrades gracefully to single-node in-process execution.
+
+```
+┌──────────────────────────────┐        ┌──────────────────────────────┐
+│         Web Node(s)          │        │       Worker Node(s)         │
+│  ┌────────────────────────┐  │        │  ┌────────────────────────┐  │
+│  │  Harness (agent loop)  │  │        │  │ process_one() / loop   │  │
+│  │  _exec_tool()          │  │        │  │  execute_tool() hook   │  │
+│  └───────────┬────────────┘  │        │  └───────────┬────────────┘  │
+└──────────────┼───────────────┘        └──────────────┼───────────────┘
+               │                                       │
+   enqueue (LPUSH) / await (BRPOP)       consume (BRPOP) → result (LPUSH)
+               │                                       │
+               └───────────────┬───────────────────────┘
+                               ▼
+              ┌──────────────────────────────────────────┐
+              │                  Redis                   │
+              │  task queue : pyharness:tool_tasks       │
+              │  result key : pyharness:tool_result:<id> │
+              │  event bus  : pyharness:events (Pub/Sub) │
+              │  session    : RedisSessionStorePlugin    │
+              └──────────────────────────────────────────┘
+```
+
+### Configuration
+
+Set these in `.env` (see `.env.example`) or the environment:
+
+```bash
+# Enable distributed tool execution (web node + worker)
+PYHARNESS_DISTRIBUTED_EXEC="1"
+
+# Redis connection URL
+REDIS_URL="redis://127.0.0.1:6379/0"
+```
+
+### Quick start
+
+```bash
+# 1. Start Redis (or use a hosted instance) and export REDIS_URL
+
+# 2. Start one or more workers — each consumes tool tasks off the queue
+pyharness worker
+
+# 3. Run the web node with distributed execution enabled
+pyharness serve
+# → Tools now execute on the worker process(es); stream events flow back live
+```
+
+Without `REDIS_URL` or with `PYHARNESS_DISTRIBUTED_EXEC` unset, everything runs
+in-process as before — no config change is needed for single-node use.
+
+---
+
 ## 📦 Built-in Plugins
 
 | Plugin | Entry Point | Responsibility |

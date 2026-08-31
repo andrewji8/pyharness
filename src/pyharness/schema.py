@@ -9,6 +9,7 @@ hard-coding any provider or executor logic.
 
 from __future__ import annotations
 
+import time
 import uuid
 from datetime import datetime, timezone
 from enum import Enum
@@ -38,6 +39,7 @@ class EventType(str, Enum):
     ASSISTANT_FINISHED = "assistant.finished"
     TOOL_CALLED = "tool.called"
     TOOL_RESULT = "tool.result"
+    TOOL_STREAM = "tool.stream"
     STEP = "step.completed"
     SESSION_STARTED = "session.started"
     SESSION_FINISHED = "session.finished"
@@ -101,6 +103,43 @@ class ToolResult(Frozen):
     duration_seconds: float = Field(default=0.0, ge=0.0)
 
 
+class ToolTask(Frozen):
+    """A tool-execution task to be run on a remote worker (distributed mode).
+
+    This is the unit of work that moves off the web node onto an independent
+    ``pyharness worker`` process. Represents only pure data — the full
+    :class:`ToolSpec` is embedded so the worker does not need to rediscover it.
+    """
+
+    task_id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    session_id: uuid.UUID = Field(default_factory=uuid.uuid4)
+    tool: ToolSpec
+    arguments: dict[str, Any] = Field(default_factory=dict)
+    timeout: float = Field(default=30.0, gt=0.0)
+    source_instance_id: str = ""
+
+
+class ToolTaskResult(Frozen):
+    """Result envelope written back to the web node for one :class:`ToolTask`."""
+
+    task_id: uuid.UUID
+    result: ToolResult
+
+
+class ToolStreamEvent(Frozen):
+    """Intermediate output emitted while a tool runs (streaming feedback).
+
+    Tools that perform long-running or verbose work (e.g. executing code) can
+    push partial results through ``SessionContext.tool_emitter`` so observers
+    (CLI, WebSocket UI) can show progress before the final :class:`ToolResult`.
+    """
+
+    tool_name: str
+    stream_type: Literal["stdout", "stderr", "log", "progress"]
+    content: str
+    timestamp: float = Field(default_factory=time.time)
+
+
 # --------------------------------------------------------------------------- #
 # LLM traffic (transport-agnostic; providers are plugins)
 # --------------------------------------------------------------------------- #
@@ -111,6 +150,31 @@ class Role(str, Enum):
     TOOL = "tool"
 
 
+class ContentPartType(str, Enum):
+    """Discriminator for a :class:`ContentPart` payload."""
+
+    TEXT = "text"
+    IMAGE = "image"
+
+
+class ContentPart(Frozen):
+    """A single typed fragment of a multimodal message.
+
+    Exactly one of ``text`` / ``url`` carries the payload:
+
+    * ``text`` → ``type="text"`` plain text
+    * ``url``  → ``type="image"`` — an ``http(s)`` URL **or** a base64
+      ``data:`` URL (e.g. ``data:image/png;base64,....``).
+    * ``url``  → ``type="audio"`` — a base64 ``data:`` URL (e.g.
+      ``data:audio/wav;base64,....``); the audio is transcribed to text via the
+      ``audio_transcribe`` tool before being sent to the chat model.
+    """
+
+    type: Literal["text", "image", "audio"]
+    text: str | None = Field(default=None, description="Text payload (type='text').")
+    url: str | None = Field(default=None, description="URL payload (type='image'|'audio'): http(s) or base64 data-url.")
+
+
 class Message(Frozen):
     """One turn in a conversation slice."""
 
@@ -119,6 +183,10 @@ class Message(Frozen):
     name: str | None = Field(default=None, description="Tool/role name, when relevant.")
     tool_calls: tuple["ToolCall", ...] = Field(default_factory=tuple)
     tool_call_id: str | None = Field(default=None, description="Tool call ID for tool messages.")
+    parts: tuple[ContentPart, ...] = Field(
+        default_factory=tuple,
+        description="Optional multimodal fragments. Empty = legacy str-only message.",
+    )
 
 
 class ToolCall(Frozen):
@@ -168,7 +236,7 @@ class SubagentSpec(Frozen):
     system_prompt: str | None = Field(default=None, description="子 Agent 的系统提示词（可选）")
     allowed_tools: list[str] | None = Field(default=None, description="允许使用的工具白名单（None 表示继承全部）")
     max_turns: int = Field(default=5, ge=1, le=20, description="子 Agent 最大循环轮次")
-    timeout: float = Field(default=120.0, ge=10, description="执行超时（秒）")
+    timeout: float = Field(default=240.0, ge=10, description="执行超时（秒）")
 
 
 class SubagentResult(Frozen):
@@ -262,6 +330,9 @@ class SessionData(Frozen):
     messages: tuple[Message, ...] = Field(default_factory=tuple)
     memory: dict[str, Any] = Field(default_factory=dict)
     created_at: datetime = Field(default_factory=_utcnow)
+    # Precomputed by lightweight list endpoints (COUNT query) so listings never
+    # need to load full message bodies. 0 when unknown / not computed.
+    message_count: int = 0
 
 
 class MemorySearchResult(Frozen):
@@ -405,6 +476,8 @@ class HarnessConfig(Frozen):
 # Re-export commonly-used aliases for a tidy public surface.
 __all__ = [
     "AgentConfig",
+    "ContentPart",
+    "ContentPartType",
     "Event",
     "EventType",
     "Frozen",
@@ -425,6 +498,7 @@ __all__ = [
     "ToolResult",
     "ToolResultStatus",
     "ToolSpec",
+    "ToolStreamEvent",
     "UpdatePlanInput",
     "WorkflowPlan",
     "WorkflowStep",

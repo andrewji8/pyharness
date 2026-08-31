@@ -11,21 +11,27 @@ Design
 * Each subagent receives the parent context so it can reference prior history.
 * Results are returned as a single structured tool result, ready to be
   injected back into the parent conversation.
+* [Fix] Subagents use the real OpenRouter model (never the dummy provider).
+* [Fix] Each subagent runs in an isolated open_session scope (no deadlocks).
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from typing import Any
 
 from pluggy import HookimplMarker
 
-from pyharness.context import SessionContext
+from pyharness.context import SessionContext, open_session
 from pyharness.schema import AgentConfig, SubagentResult, SubagentSpec, ToolArg, ToolResult, ToolResultStatus, ToolSpec
 
 logger = logging.getLogger(__name__)
 hookimpl = HookimplMarker("pyharness")
+
+# 主会话使用的真实模型（OpenRouter）。子 Agent 严禁回退到 dummy provider。
+DEFAULT_MODEL = "nvidia/nemotron-3-ultra-550b-a55b:free"
 
 
 class SubagentToolPlugin:
@@ -135,9 +141,23 @@ class SubagentToolPlugin:
         tools: list[ToolSpec] = []
         for plugin_specs in self.harness.bus.pm.hook.get_tool_specs(context=parent_ctx):
             tools.extend(plugin_specs)
+
+        # 【修复 1】排除 spawn_subagents 自身，防止子 Agent 无限递归派生
+        tools = [t for t in tools if t.name != "spawn_subagents"]
+        logger.info("[subagent] parent tools collected: %s", [t.name for t in tools])
+
+        # 【修复 2】子 Agent 必须用真实模型，严禁回退到 dummy provider
+        model = (
+            getattr(parent_ctx, "model", None)
+            or os.environ.get("OPENROUTER_MODEL")
+            or os.environ.get("LLM_MODEL")
+            or DEFAULT_MODEL
+        )
+        logger.info("[subagent] using model=%s", model)
+
         parent_config = AgentConfig(
             name=getattr(parent_ctx, "agent_name", "parent"),
-            model=getattr(parent_ctx, "model", "default"),
+            model=model,
         )
 
         async def _run_one(index: int, spec: SubagentSpec) -> SubagentResult:
@@ -147,12 +167,24 @@ class SubagentToolPlugin:
                     timeout=spec.timeout,
                 )
             except asyncio.TimeoutError:
+                logger.warning("[subagent] %s timed out", spec.name)
                 return SubagentResult(
                     spec=spec,
                     status="timeout",
                     output=None,
                     error=f"超时（{spec.timeout}s）",
                     duration_seconds=spec.timeout,
+                    session_id="",
+                )
+            except Exception as exc:
+                # 【修复 3】捕获所有异常，防止 TaskGroup 崩溃导致界面卡死
+                logger.exception("[subagent] %s crashed", spec.name)
+                return SubagentResult(
+                    spec=spec,
+                    status="error",
+                    output=None,
+                    error=str(exc),
+                    duration_seconds=0.0,
                     session_id="",
                 )
 
@@ -172,15 +204,13 @@ class SubagentToolPlugin:
         parent_tools: list[ToolSpec],
         parent_config: AgentConfig,
     ) -> SubagentResult:
-        """Wrap ``spawn_subagent`` with error isolation.
-
-        Returns a failed ``SubagentResult`` instead of raising, ensuring one
-        crashing subagent does not affect the rest of the batch.
-        """
+        """Wrap ``spawn_subagent`` with error isolation and ContextVar isolation."""
         try:
-            return await self.harness.spawn_subagent(
-                spec, parent_tools=parent_tools, parent_config=parent_config
-            )
+            # 【修复 4】open_session 隔离 ContextVar，切断与外层 chat 的关联，防嵌套死锁
+            async with open_session(namespace=f"subagent:{spec.name}"):
+                return await self.harness.spawn_subagent(
+                    spec, parent_tools=parent_tools, parent_config=parent_config
+                )
         except Exception as exc:
             logger.exception("Subagent %s failed", spec.name)
             return SubagentResult(
